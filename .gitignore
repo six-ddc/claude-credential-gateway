@@ -1,0 +1,8 @@
+node_modules/
+# 永不提交任何凭证
+.env
+.env.*
+*.local
+*token*.txt
+*.pem
+*.key
