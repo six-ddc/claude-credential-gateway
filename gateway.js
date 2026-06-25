@@ -129,9 +129,18 @@ const server = http.createServer((req, res) => {
           const errChunks = []
           upRes.on('data', c => errChunks.push(c))
           upRes.on('end', () => {
-            console.error(`[upstream ${status}]`, Buffer.concat(errChunks).toString('utf8').slice(0, 2000))
+            const raw = Buffer.concat(errChunks)
+            let text = raw
+            try {
+              const zlib = require('zlib')
+              const enc = (upRes.headers['content-encoding'] || '').toLowerCase()
+              if (enc === 'gzip') text = zlib.gunzipSync(raw)
+              else if (enc === 'br') text = zlib.brotliDecompressSync(raw)
+              else if (enc === 'deflate') text = zlib.inflateSync(raw)
+            } catch {}
+            console.error(`[upstream ${status}]`, text.toString('utf8').slice(0, 2000))
             res.writeHead(status, upRes.headers)
-            res.end(Buffer.concat(errChunks))
+            res.end(raw) // 给客户端转发的仍是原始(压缩)字节,不动
           })
         } else {
           res.writeHead(status, upRes.headers)
