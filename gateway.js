@@ -122,9 +122,21 @@ const server = http.createServer((req, res) => {
     const up = transport.request(
       { host: UPSTREAM_BASE.hostname, port: upstreamPort, method: req.method, path, headers },
       upRes => {
-        audit({ ts: Date.now(), ok: true, user: user.id, model, status: upRes.statusCode, mode: UPSTREAM_MODE })
-        res.writeHead(upRes.statusCode || 502, upRes.headers)
-        upRes.pipe(res) // SSE 流式回传
+        const status = upRes.statusCode || 502
+        audit({ ts: Date.now(), ok: true, user: user.id, model, status, mode: UPSTREAM_MODE })
+        if (status >= 400) {
+          // 出错时把上游响应体打出来,看真正原因(429/401/400 的 message)
+          const errChunks = []
+          upRes.on('data', c => errChunks.push(c))
+          upRes.on('end', () => {
+            console.error(`[upstream ${status}]`, Buffer.concat(errChunks).toString('utf8').slice(0, 2000))
+            res.writeHead(status, upRes.headers)
+            res.end(Buffer.concat(errChunks))
+          })
+        } else {
+          res.writeHead(status, upRes.headers)
+          upRes.pipe(res) // SSE 流式回传
+        }
       },
     )
     up.on('error', e => {
