@@ -38,6 +38,7 @@ type certAuthority struct {
 	cert        *x509.Certificate
 	key         *ecdsa.PrivateKey
 	certPath    string // 分发给设备的证书路径
+	certPEM     []byte // 同一份证书的 PEM,经 /ca 发给已认证的设备
 	fingerprint string // SHA256(DER),设备端比对用
 }
 
@@ -98,6 +99,7 @@ func parseCA(data []byte, path string) (*certAuthority, error) {
 		return nil, errors.New("文件里缺少 CERTIFICATE 或 PRIVATE KEY 块")
 	}
 	ca.fingerprint = certFingerprint(ca.cert)
+	ca.certPEM = pemBlock("CERTIFICATE", ca.cert.Raw)
 	return ca, nil
 }
 
@@ -140,8 +142,11 @@ func createCA(path string) (*certAuthority, error) {
 	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
 		return nil, err
 	}
-	ca := &certAuthority{cert: cert, key: key, certPath: path + ".crt", fingerprint: certFingerprint(cert)}
-	if err := os.WriteFile(ca.certPath, pemBlock("CERTIFICATE", der), 0o644); err != nil {
+	ca := &certAuthority{
+		cert: cert, key: key, certPath: path + ".crt",
+		certPEM: pemBlock("CERTIFICATE", der), fingerprint: certFingerprint(cert),
+	}
+	if err := os.WriteFile(ca.certPath, ca.certPEM, 0o644); err != nil {
 		return nil, err
 	}
 	log.Printf("已生成 TLS 终结 CA: %s(设备端信任 %s)", path, ca.certPath)

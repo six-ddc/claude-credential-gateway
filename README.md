@@ -65,11 +65,14 @@ export CLAUDE_GATEWAY_UPSTREAM_OAUTH='<你的订阅 access token>'
 # 启动日志会打印 SSH host key 指纹,发给设备首连时比对
 ```
 
-**② 设备**(每台一把专用密钥,私钥不外传;公钥整行填进网关 `ssh.authorized_keys`):
+**② 设备**(每台一把专用密钥,私钥不外传;公钥整行交给管理员登记):
 ```bash
 ssh-keygen -t ed25519 -f ~/keys/ccgw_laptop-1 -N "" -C "laptop-1"
-cat ~/keys/ccgw_laptop-1.pub   # ← 把这行交给网关登记,id 填 laptop-1
+cat ~/keys/ccgw_laptop-1.pub   # ← 把这行交给网关管理员,id 填 laptop-1
 ```
+
+> 设备**不需要、也不应该有**登录网关机的权限 —— 有的话它直接读 `config.yaml` 就把真
+> token 拿走了,凭证隔离当场失效。登记动作由管理员在网关侧完成(见下文脚本)。
 
 **③ 起隧道 + 跑 claude**(首连核对 host key 指纹,之后指纹变化 SSH 直接拦,防 MITM):
 ```bash
@@ -149,17 +152,34 @@ Claude Code 认一个 `ANTHROPIC_UNIX_SOCKET` 环境变量 —— 这正是官�
 
 网关**同时**支持两种形态,靠首字节嗅探自动区分(TLS 记录以 `0x16` 开头),无需任何配置开关。
 
-**一键接入**:[`scripts/setup-device.sh`](./scripts/setup-device.sh) 把下面几步都做了
-(生成密钥 → 登记公钥 → pin host key → 取 CA → 起隧道 → 验证)。先改脚本顶部的网关地址,
-或用环境变量覆盖:
+**脚本接入**:分设备侧与管理员侧两个脚本 —— **设备对网关机没有任何登录权限**,
+它能做的只有建隧道。登记谁由管理员在网关上决定。
 
+设备侧([`scripts/setup-device.sh`](./scripts/setup-device.sh)),第一趟拿公钥:
 ```bash
-GATEWAY_HOST=你的网关 GATEWAY_ADMIN=root@你的网关 GATEWAY_DIR=/opt/claude-credential-gateway \
+GATEWAY_HOST=你的网关 ./scripts/setup-device.sh laptop-1
+# 隧道会失败(公钥还没登记),脚本打印出本机公钥,把它和 device-id 交给管理员
+```
+
+管理员侧([`scripts/add-device.sh`](./scripts/add-device.sh)),**在网关机上**跑:
+```bash
+./scripts/add-device.sh laptop-1 "ssh-ed25519 AAAA... laptop-1"   # 登记,热重载即生效
+# 它会打印 host key 指纹,带外回给设备
+./scripts/add-device.sh --list            # 看已登记设备 + 指纹
+./scripts/add-device.sh --remove laptop-1 # 吊销
+```
+
+设备侧第二趟,带上指纹:
+```bash
+GATEWAY_HOST=你的网关 GATEWAY_HOST_KEY_FP='SHA256:xxxx' \
   ./scripts/setup-device.sh laptop-1
 ```
 
-> 设备密钥与 CA 存 `~/.ccgw/`(不进仓库)。管理通道(`GATEWAY_ADMIN`)只在接入时用一次,
-> 平时跑 claude 不需要。
+> 指纹必须**带外**拿(当面/IM/邮件),它是防 MITM 的信任锚 —— 从待连接的网络里取指纹等于
+> 让攻击者自己给你发指纹。不带指纹也能跑(TOFU),脚本会打印实际指纹要求你人工核对。
+>
+> **CA 证书不需要带外分发**:隧道建起来之后,SSH 已经完成认证与加密,脚本经隧道
+> `GET /ca` 自取即可。设备密钥与 CA 存 `~/.ccgw/`(不进仓库)。
 
 手动做的话,设备侧相对 Level 1 改三处:
 ```bash

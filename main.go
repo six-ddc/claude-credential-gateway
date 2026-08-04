@@ -38,6 +38,7 @@ var (
 	cfg         *Config
 	upstreamURL *url.URL
 	httpClient  *http.Client
+	caCertPEM   []byte // TLS 终结 CA 的证书,经 /ca 发给已认证的设备
 )
 
 // 逐跳头(hop-by-hop)与不应透传的头,在透明转发时剥掉。
@@ -102,7 +103,8 @@ func main() {
 	log.Printf("SSH 转发层(转发-only,唯一对外端口)监听 %s → 白名单 %s",
 		cfg.SSH.Addr, strings.Join(cfg.SSH.PermitTargets, ", "))
 	log.Printf("SSH host key 指纹: %s(设备首连时比对)", sshSrv.fingerprint)
-	log.Printf("TLS 终结 CA: %s(设备端 NODE_EXTRA_CA_CERTS 用它)", sshSrv.ca.certPath)
+	log.Printf("TLS 终结 CA: %s(设备经隧道 GET /ca 自取)", sshSrv.ca.certPath)
+	caCertPEM = sshSrv.ca.certPEM
 	log.Printf("注入: 订阅 OAuth token (len=%d)", len(cfg.Upstream.OAuth))
 	ids := make([]string, 0, len(cfg.SSH.AuthorizedKeys))
 	for _, ak := range cfg.SSH.AuthorizedKeys {
@@ -120,17 +122,23 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	//    客户端 Authorization 里的占位 token 不参与鉴权,随后会被真凭证整个覆盖。
 	device := deviceFrom(r.Context())
 
-	// 1.5) /status:返回最近采样到的订阅限额快照(5h/7d 还剩多少、几点重置),经隧道可查。
-	if r.URL.Path == "/status" {
-		writeStatus(w)
-		return
-	}
-
-	// 防御纵深:当前所有连接都来自 SSH 隧道(必有设备身份);
-	// 若未来再加别的监听面,没有设备身份的请求也拿不到真凭证。
+	// 唯一入口是 SSH 隧道,所以一切请求都必须带设备身份。
 	if device == "" {
 		writeError(w, 403, "ssh tunnel required")
 		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "no_tunnel", "path": r.URL.Path})
+		return
+	}
+
+	switch r.URL.Path {
+	case "/status":
+		// 最近采样到的订阅限额快照(5h/7d 还剩多少、几点重置)
+		writeStatus(w)
+		return
+	case "/ca":
+		// TLS 终结用的 CA 证书。设备接入时经【已认证的隧道】取它,
+		// 就不需要给设备开任何登录网关机的通道(公钥登记由管理员在网关侧做)。
+		w.Header().Set("content-type", "application/x-pem-file")
+		w.Write(caCertPEM)
 		return
 	}
 
