@@ -4,6 +4,11 @@
 Claude 订阅,而**不在那些电脑上暴露真 token**。真 OAuth token 只留在一台你信任的网关机器上,不可
 信电脑只放占位 token + 一个可吊销的设备 key,真请求经网关时被注入真凭证。
 
+**唯一对外入口是一个自建的转发-only SSH 端口**(复刻 `claude ssh` 的传输形态):公钥认证、
+只能转发到网关自己、无 shell / 无 exec / 禁 `-R`,host key pin 防 MITM。网关**不监听任何
+HTTP 端口**:转发 channel 在进程内直连 HTTP handler,设备一律经 SSH 隧道接入。方案详见
+[docs/ssh-forward-gateway.md](./docs/ssh-forward-gateway.md)。
+
 同时,网关会**打印每个请求的 model 与 token 使用量**(input / output / cache),用 `gjson` 从上游响应
 高性能解析,支持 SSE 流式与普通 JSON。
 
@@ -15,6 +20,7 @@ Claude 订阅,而**不在那些电脑上暴露真 token**。真 OAuth token 只�
 - [`gopkg.in/yaml.v3`](https://pkg.go.dev/gopkg.in/yaml.v3) —— YAML 配置解析
 - [`github.com/tidwall/gjson`](https://github.com/tidwall/gjson) —— 高性能 token 用量解析
 - [`github.com/andybalholm/brotli`](https://github.com/andybalholm/brotli) —— br 响应解压(打印/解析用)
+- [`golang.org/x/crypto/ssh`](https://pkg.go.dev/golang.org/x/crypto/ssh) —— 转发-only SSH 层(唯一对外入口)
 
 ## 构建与运行
 
@@ -29,40 +35,66 @@ cp config.example.yaml config.yaml        # config.yaml 已在 .gitignore,改它
 (env 覆盖 YAML),这样模板可以安全提交:
 
 ```yaml
-host: 127.0.0.1
-port: 8788
 upstream:
   base: https://api.anthropic.com
   oauth: ""               # 你订阅的真 access token;留空则用 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入
-users:
-  sk-ant-oat01-alice-REPLACE-ME: { id: alice }
+ssh:                      # 唯一对外入口:转发-only SSH;设备身份的单一数据源
+  addr: ":2222"                       # 唯一对外端口
+  host_key: ./ssh_host_ed25519_key    # 服务端私钥;不存在则首启自动生成
+  ca_key: ./ccgw_ca_key               # TLS 终结 CA;自动生成,另导出 .crt 供设备信任
+  permit_targets:                     # 客户端 -L 声明的目标须在其中(网关并不真监听它们)
+    - 127.0.0.1:8788
+    - unix:/run/ccgw.sock
+  authorized_keys:                    # 每台设备一把公钥;改完重读即生效,无需重启
+    - id: laptop-1
+      key: "ssh-ed25519 AAAA... laptop-1"
 ```
 
 配置路径优先级:`GATEWAY_CONFIG` 指定 > 本地 `config.yaml` > `config.example.yaml`(模板,并提示拷贝)。
 
-可用环境变量覆盖:`GATEWAY_HOST`、`GATEWAY_PORT`、`GATEWAY_UPSTREAM_BASE`、
-`CLAUDE_GATEWAY_UPSTREAM_OAUTH`、`GATEWAY_USERS`(JSON)。
+可用环境变量覆盖:`GATEWAY_UPSTREAM_BASE`、`CLAUDE_GATEWAY_UPSTREAM_OAUTH`、
+`GATEWAY_SSH_ADDR`、`GATEWAY_SSH_HOST_KEY`、`GATEWAY_SSH_CA_KEY`、
+`GATEWAY_SSH_PERMIT_TARGETS`(逗号分隔)、`GATEWAY_SSH_AUTHORIZED_KEYS`(JSON `[{id,key}]`)。
 
 ## 快速开始
 
-网关机器(你信任的常驻机):
+**① 网关机器**(你信任的常驻机):在 `config.yaml` 登记设备公钥(见下),然后:
 ```bash
 export CLAUDE_GATEWAY_UPSTREAM_OAUTH='<你的订阅 access token>'
-export GATEWAY_HOST=0.0.0.0
-export GATEWAY_USERS='{"sk-ant-oat01-laptop-1-REPLACE-ME":{"id":"laptop-1"}}'
-./claude-credential-gateway       # 生产前面挂 TLS + VPN/IP allowlist
+./claude-credential-gateway
+# 启动日志会打印 SSH host key 指纹,发给设备首连时比对
 ```
 
-不可信电脑(只放占位 token,不放真 token)—— 纯原生 Claude Code,无需自定义头:
+**② 设备**(每台一把专用密钥,私钥不外传;公钥整行填进网关 `ssh.authorized_keys`):
 ```bash
+ssh-keygen -t ed25519 -f ~/keys/ccgw_laptop-1 -N "" -C "laptop-1"
+cat ~/keys/ccgw_laptop-1.pub   # ← 把这行交给网关登记,id 填 laptop-1
+```
+
+**③ 起隧道 + 跑 claude**(首连核对 host key 指纹,之后指纹变化 SSH 直接拦,防 MITM):
+```bash
+ssh -N -L 8788:127.0.0.1:8788 -p 2222 -i ~/keys/ccgw_laptop-1 laptop-1@网关机 &
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-laptop-1-REPLACE-ME'  # 该设备的占位,即网关里的设备 key
-export ANTHROPIC_BASE_URL='https://你的网关'
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-placeholder'  # 任意占位,只为让 claude 肯启动
 claude
 ```
 
-> 占位 token 本身就是设备 key:网关从 `Authorization: Bearer` 里读它识别设备,再覆盖成真凭证。
-> 每台设备用**不同的**占位以便区分审计;占位最好仿真凭证前缀,避免客户端校验 token 格式时报错。
+> 想更严一点,可以改用 **unix socket 形态**(复刻 `claude ssh` 的传输形态):本机不开 TCP 端口,
+> socket 文件 `0600` 只有你自己能连。见下节。
+
+> 门禁与身份都是 SSH 公钥:转发 channel 在网关进程内直连 HTTP handler,每个请求天然携带
+> 设备 id(审计用),伪造不了。占位 token 网关不校验、只覆盖,所有设备可以填同一个假值,
+> 建议仿真凭证前缀(`sk-ant-oat01-...`)以免客户端校验格式报错。
+>
+> **占位凭证不能省**:`claude` 自己要求手里有凭证才肯启动,两个都不设会停在
+> `Not logged in · Please run /login`。`CLAUDE_CODE_OAUTH_TOKEN` 与 `ANTHROPIC_API_KEY`
+> 设哪个都能跑(网关会把客户端的 `x-api-key` 剥掉再注入真凭证),但**建议用前者** ——
+> 它让客户端走订阅分支、带上 `oauth-2025` beta 头,与网关注入的订阅 token 形状一致,
+> 这也是官方 `claude ssh` 的做法。
+> 吊销设备:从 `ssh.authorized_keys` 删掉对应项,立即生效、其它设备不受影响。
+> 网关不监听任何 HTTP 端口,真 token 只为隧道流量注入 —— 网关机上其它进程也偷用不了。
+> 限额快照可在设备上经隧道查:`curl http://127.0.0.1:8788/status`。
 
 ### ⚠ 首次初始化:绕过 onboarding(否则会逼你登录)
 
@@ -107,6 +139,46 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
 之后再 `export CLAUDE_CODE_OAUTH_TOKEN=...` + `export ANTHROPIC_BASE_URL=...` 跑 `claude`,就能直接用、
 不再要求登录账号。
 
+## unix socket 形态(`ANTHROPIC_UNIX_SOCKET`)
+
+Claude Code 认一个 `ANTHROPIC_UNIX_SOCKET` 环境变量 —— 这正是官方 `claude ssh` 用的传输形态。
+设了它之后,客户端只把**传输层**换成 unix socket,**目标 URL 仍是 `https://api.anthropic.com`,
+照常发起完整 TLS 握手**。所以网关必须自己终结 TLS 才能读到明文 HTTP 去替换 `Authorization`:
+网关首启会自动生成一把 CA(`ccgw_ca_key`),用它现签 `api.anthropic.com` 的证书;设备端用
+`NODE_EXTRA_CA_CERTS` 信任这把 CA 即可。
+
+网关**同时**支持两种形态,靠首字节嗅探自动区分(TLS 记录以 `0x16` 开头),无需任何配置开关。
+
+**一键接入**:[`scripts/setup-device.sh`](./scripts/setup-device.sh) 把下面几步都做了
+(生成密钥 → 登记公钥 → pin host key → 取 CA → 起隧道 → 验证)。先改脚本顶部的网关地址,
+或用环境变量覆盖:
+
+```bash
+GATEWAY_HOST=你的网关 GATEWAY_ADMIN=root@你的网关 GATEWAY_DIR=/opt/claude-credential-gateway \
+  ./scripts/setup-device.sh laptop-1
+```
+
+> 设备密钥与 CA 存 `~/.ccgw/`(不进仓库)。管理通道(`GATEWAY_ADMIN`)只在接入时用一次,
+> 平时跑 claude 不需要。
+
+手动做的话,设备侧相对 Level 1 改三处:
+```bash
+scp -P 2222 ... 网关机:/data/.../ccgw_ca_key.crt ~/keys/    # ① 取网关 CA(公开,不是密钥)
+ssh -N -L $HOME/.ccgw.sock:/run/ccgw.sock -p 2222 -i ~/keys/ccgw_laptop-1 laptop-1@网关机 &   # ② socket 转发
+
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+export ANTHROPIC_UNIX_SOCKET=$HOME/.ccgw.sock                # ③ 不再需要 ANTHROPIC_BASE_URL
+export NODE_EXTRA_CA_CERTS=~/keys/ccgw_ca_key.crt
+export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-placeholder'
+claude
+```
+
+> `-L` 左边是本机 socket 路径,右边 `/run/ccgw.sock` 必须在网关 `ssh.permit_targets` 里
+> (它只是白名单口令,网关并不真监听这个路径)。加 `-o StreamLocalBindUnlink=yes` 可自动清理旧 socket。
+>
+> **CA 私钥 `ccgw_ca_key` 是机密**:拿到它就能伪造 `api.anthropic.com` 证书骗过任何信任该 CA 的设备。
+> 它只该待在网关机上(已 gitignore、权限 0600);分发给设备的是 `.crt`,那个不是密钥。
+
 ## Token 用量日志
 
 每个成功请求,网关都会打印一行(从**上游响应**解析):
@@ -126,7 +198,7 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
   服务条款,且会被账号级检测(同一 `account_uuid` + 单 IP + 高并发)命中。
 - **网关保护的是 token,不是会话内容。** 不可信电脑仍能截屏/键盘记录你的 prompt 与输出。
   若那台机器真的敌对,优先用 `claude ssh <网关机器>`——让 Claude 跑在你的机器上,什么都不落地。
-- **网关须是你信任且可控的机器**,暴露时加 TLS + 设备 key 鉴权 + VPN/allowlist。
+- **网关须是你信任且可控的机器**。唯一对外面是转发-only SSH:公钥即门禁,内部 HTTP 不见公网。
 - **真凭证只走环境变量。** 别把 token 写进提交的文件;含明文 token 的本地启动脚本(如 `gateway.sh`)
   与本地 `config.yaml` 都已在 `.gitignore` 中。
 - **token 续期**:网关里只贴 access token 会几小时过期;稳妥做法是网关机器正常登录、由网关从

@@ -13,11 +13,11 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -41,7 +41,7 @@ var (
 )
 
 // 逐跳头(hop-by-hop)与不应透传的头,在透明转发时剥掉。
-// 注:占位凭证走 Authorization,会在注入真凭证时被整个覆盖,无需在此单独剥离。
+// 注:Authorization 会在注入真凭证时被整个覆盖,无需在此单独剥离。
 var stripHeaders = map[string]bool{
 	"connection":        true,
 	"proxy-connection":  true,
@@ -49,15 +49,10 @@ var stripHeaders = map[string]bool{
 	"transfer-encoding": true,
 	"upgrade":           true,
 	"content-length":    true, // 由 http.NewRequest 按 body 重新设置
-}
-
-// gatewayKey 取出客户端发来的占位凭证(Authorization: Bearer <占位>),作为前置鉴权的设备 key。
-func gatewayKey(r *http.Request) string {
-	v := r.Header.Get("authorization")
-	if i := strings.IndexByte(v, ' '); i >= 0 { // 去掉 "Bearer " 等 scheme 前缀
-		return strings.TrimSpace(v[i+1:])
-	}
-	return strings.TrimSpace(v)
+	// 设备上残留的 ANTHROPIC_API_KEY 会让客户端改发 x-api-key。它优先级高于
+	// Authorization,不剥掉的话上游拿假 key 校验 → 401 "API key is invalid"。
+	// 凭证一律由网关注入,客户端的任何凭证企图都不该到上游。
+	"x-api-key": true,
 }
 
 func main() {
@@ -87,43 +82,64 @@ func main() {
 		// 不设全局超时:SSE 流式可能很长
 	}
 
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	srv := &http.Server{Addr: addr, Handler: http.HandlerFunc(handle)}
+	reloadPath := path
+	if os.Getenv("GATEWAY_SSH_AUTHORIZED_KEYS") != "" {
+		reloadPath = "" // 公钥来自 env,不做文件热重载
+	}
+	sshSrv, err := newSSHServer(cfg.SSH, reloadPath)
+	if err != nil {
+		log.Fatalf("✗ SSH 转发层初始化失败: %v", err)
+	}
+	if len(cfg.SSH.AuthorizedKeys) == 0 {
+		log.Printf("⚠ ssh.authorized_keys 为空:任何设备都连不上,请先登记公钥(改 config.yaml 即生效)")
+	}
+
+	// 隧道流量与本地回环共用同一个 HTTP Server;ConnContext 把 SSH 层认证出的
+	// device id 写进每个请求的 context —— handler 据此区分「隧道请求」与「本地请求」。
+	srv := &http.Server{Handler: http.HandlerFunc(handle), ConnContext: deviceConnContext}
 
 	log.Printf("凭证隔离网关 → %s", upstreamURL.String())
-	log.Printf("监听 http://%s", addr)
+	log.Printf("SSH 转发层(转发-only,唯一对外端口)监听 %s → 白名单 %s",
+		cfg.SSH.Addr, strings.Join(cfg.SSH.PermitTargets, ", "))
+	log.Printf("SSH host key 指纹: %s(设备首连时比对)", sshSrv.fingerprint)
+	log.Printf("TLS 终结 CA: %s(设备端 NODE_EXTRA_CA_CERTS 用它)", sshSrv.ca.certPath)
 	log.Printf("注入: 订阅 OAuth token (len=%d)", len(cfg.Upstream.OAuth))
-	ids := make([]string, 0, len(cfg.Users))
-	for _, usr := range cfg.Users {
-		ids = append(ids, usr.ID)
+	ids := make([]string, 0, len(cfg.SSH.AuthorizedKeys))
+	for _, ak := range cfg.SSH.AuthorizedKeys {
+		ids = append(ids, ak.ID)
 	}
-	log.Printf("设备/用户 key: %s", strings.Join(ids, ", "))
+	log.Printf("可信设备: %s", strings.Join(ids, ", "))
 
-	log.Fatal(srv.ListenAndServe())
+	// 转发 channel 直接进 HTTP Server,全程不监听任何本机 HTTP 端口。
+	go func() { log.Fatalf("✗ 隧道 HTTP 退出: %v", srv.Serve(sshSrv.tunnels)) }()
+	log.Fatal(sshSrv.listenAndServe())
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
+	// 1) 身份来自连接本身:SSH 层公钥认证出的 device id(ConnContext 写入)。
+	//    客户端 Authorization 里的占位 token 不参与鉴权,随后会被真凭证整个覆盖。
+	device := deviceFrom(r.Context())
+
+	// 1.5) /status:返回最近采样到的订阅限额快照(5h/7d 还剩多少、几点重置),经隧道可查。
+	if r.URL.Path == "/status" {
+		writeStatus(w)
+		return
+	}
+
+	// 防御纵深:当前所有连接都来自 SSH 隧道(必有设备身份);
+	// 若未来再加别的监听面,没有设备身份的请求也拿不到真凭证。
+	if device == "" {
+		writeError(w, 403, "ssh tunnel required")
+		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "no_tunnel", "path": r.URL.Path})
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, 400, "read body failed")
 		return
 	}
 	_ = r.Body.Close()
-
-	// 1) 前置鉴权:客户端发的占位凭证(Authorization: Bearer)就是设备 key。
-	//    读完即用于识别设备,随后会被真凭证整个覆盖,绝不外泄。
-	user, ok := cfg.Users[gatewayKey(r)]
-	if !ok {
-		writeError(w, 401, "invalid gateway credential")
-		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "auth", "path": r.URL.Path})
-		return
-	}
-
-	// 1.5) /status:返回最近采样到的订阅限额快照(5h/7d 还剩多少、几点重置)
-	if r.URL.Path == "/status" {
-		writeStatus(w)
-		return
-	}
 
 	// 2) 模型(仅审计;真正的 token 用量从响应解析)
 	reqModel := gjson.GetBytes(body, "model").String()
@@ -151,13 +167,13 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	upRes, err := httpClient.Do(upReq)
 	if err != nil {
 		writeError(w, 502, "upstream error: "+err.Error())
-		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "upstream", "user": user.ID, "err": err.Error()})
+		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "upstream", "user": device, "err": err.Error()})
 		return
 	}
 	defer upRes.Body.Close()
 
 	status := upRes.StatusCode
-	audit(map[string]any{"ts": nowMs(), "ok": true, "user": user.ID, "model": reqModel, "status": status})
+	audit(map[string]any{"ts": nowMs(), "ok": true, "user": device, "model": reqModel, "status": status})
 
 	// 被动采样订阅限额(5h/7d):每个响应都带这些头,零额外请求。
 	logRateLimit(sampleRateLimit(upRes.Header))
@@ -184,7 +200,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if u := extractUsage(decodeBody(buf.Bytes(), enc), upRes.Header.Get("content-type")); u != nil {
-		logUsage(user, reqModel, u)
+		logUsage(device, reqModel, u)
 	}
 }
 
@@ -290,7 +306,7 @@ func extractUsage(text, contentType string) *Usage {
 	}
 }
 
-func logUsage(user User, reqModel string, u *Usage) {
+func logUsage(device, reqModel string, u *Usage) {
 	model := u.Model
 	if model == "" {
 		model = reqModel
@@ -300,7 +316,7 @@ func logUsage(user User, reqModel string, u *Usage) {
 	}
 	total := u.Input + u.Output + u.CacheCreate + u.CacheRead
 	log.Printf("[usage] user=%s model=%s input=%d output=%d cache_create=%d cache_read=%d total=%d",
-		user.ID, model, u.Input, u.Output, u.CacheCreate, u.CacheRead, total)
+		device, model, u.Input, u.Output, u.CacheCreate, u.CacheRead, total)
 }
 
 func copyHeaders(dst, src http.Header) {

@@ -4,23 +4,24 @@
 # 真凭证建议用环境变量注入(env 覆盖 YAML);也可直接写进本地 config.yaml。
 # 也可以用 GATEWAY_CONFIG=/path/to/your.yaml 指向自己的配置文件。
 
-# 监听地址(生产/公网暴露请放 TLS + 防火墙/VPN 后,host 再改 0.0.0.0)
-host: 127.0.0.1
-port: 8788
-
 upstream:
   base: https://api.anthropic.com
   # 真凭证:你订阅的 access token(以 Authorization: Bearer 注入)。
   # 留空则用环境变量 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入。
   oauth: ""
 
-# 前置鉴权:每台设备配一个【不同的】占位 token → { id }。
-# 把这个占位下发给客户端当 CLAUDE_CODE_OAUTH_TOKEN,
-# 网关用它识别设备(per-device 审计全靠它),再换成真凭证转发。占位不是真凭证。
-# 提示:占位最好仿真凭证前缀(如 sk-ant-oat01-...),避免客户端对 token 格式做校验时报错。
-# 也可用环境变量 GATEWAY_USERS(JSON)覆盖。
-users:
-  sk-ant-oat01-alice-REPLACE-ME:
-    id: alice
-  sk-ant-oat01-bob-REPLACE-ME:
-    id: bob
+# 转发-only SSH 层:唯一对外入口(始终启用)。设备身份 = SSH 公钥,单一数据源就是下面的
+# authorized_keys;客户端 CLAUDE_CODE_OAUTH_TOKEN 填任意占位值即可(网关不校验,只覆盖)。
+# 公钥认证、只能转发到 permit_target、无 shell/exec、禁 -R。详见 docs/ssh-forward-gateway.md。
+ssh:
+  addr: ":2222"                       # 唯一对外端口
+  host_key: ./ssh_host_ed25519_key    # 服务端私钥(机密,已 gitignore);不存在则首启自动生成
+  ca_key: ./ccgw_ca_key               # TLS 终结 CA(机密);自动生成,另导出 ccgw_ca_key.crt 给设备信任
+  # 转发白名单:客户端 -L 声明的目标须在其中(网关并不真监听它们)。
+  # 两项分别对应两种客户端形态:ANTHROPIC_BASE_URL(明文)与 ANTHROPIC_UNIX_SOCKET(TLS)。
+  permit_targets:
+    - 127.0.0.1:8788
+    - unix:/run/ccgw.sock
+  authorized_keys:                    # 可信设备公钥,每台一项;改 config.yaml 重读即生效
+    - id: laptop-1
+      key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA-REPLACE-ME laptop-1"
