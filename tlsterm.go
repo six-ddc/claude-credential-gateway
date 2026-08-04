@@ -7,6 +7,17 @@
 // 每次启动在内存里用它签一张叶证书;设备用 NODE_EXTRA_CA_CERTS 信任该 CA 即可。
 //
 // 这只解密【你自己设备发给你自己网关】的流量,等价于 claude ssh 本地代理做的事。
+//
+// 依据(Claude Code 客户端源码,以及在本网关上的实测):
+//   - utils/proxy.ts:设了 ANTHROPIC_UNIX_SOCKET 时,fetch options 只多一个 {unix: path},
+//     URL 与 TLS 一概不变 —— 所以传输层虽换成 socket,握手照做,SNI 仍是 api.anthropic.com。
+//   - utils/auth.ts:该模式下 CLAUDE_CODE_OAUTH_TOKEN 是占位值,只为让客户端走订阅分支、
+//     带上 oauth-2025 beta 头,与代理即将注入的真凭证形状对齐。
+//   - 实测:设 NODE_EXTRA_CA_CERTS 指向本 CA 则握手成功、拿到明文 POST /v1/messages;
+//     不设则客户端报 SSL certificate verification failed 并立即断开。
+//
+// 方向差异:官方 claude ssh 是 -R(远端发布 socket、连接回流到你本机的代理,凭证在你手边);
+// 本网关相反,凭证在服务端,所以设备侧用 -L + 本地 socket。传输形态一致,方向相反。
 package main
 
 import (

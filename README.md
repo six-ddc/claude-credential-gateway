@@ -38,8 +38,6 @@ api.anthropic.com
 - 同时,网关会**打印每个请求的 model 与 token 使用量**(input / output / cache),用 `gjson`
   从上游响应解析,支持 SSE 流式与普通 JSON。
 
-传输层方案详见 [docs/ssh-forward-gateway.md](./docs/ssh-forward-gateway.md)。
-
 ## 技术栈
 
 - Go 1.25+(`go.mod` 声明;低版本工具链会按 `GOTOOLCHAIN` 自动下载)
