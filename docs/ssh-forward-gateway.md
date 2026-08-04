@@ -40,7 +40,7 @@
   ▼
 进程内网关 handler(转发 channel 进程内直连,不监听任何 HTTP 端口)
   · 注入真凭证(setup-token 长效 / keychain 自动刷新)
-  · 并发闸门 + 限额被动采样/退避 + per-device 审计
+  · 限额被动采样 + per-device 审计(并发闸门尚未实现,见 §8)
   ▼
 api.anthropic.com
 ```
@@ -152,12 +152,22 @@ ccgw_ca_key.crt
 
 ## 8. 落地里程碑
 
-1. **`sshfwd.go`**:SSH server + `PublicKeyCallback` + channel 分发(`direct-tcpip` / `direct-streamlocal` / 其余 Reject)+ `splice` 双向拷贝 + host key 加载/自动生成 + `authorized_keys` 解析与热重载。
-2. **wiring**:`GATEWAY_SSH_ADDR` 设了就启用;`direct-tcpip` 目标直连进程内网关(loopback 或 unix socket)。
-3. **P0 并发闸门**:单账号单飞/低并发限制器(反误杀关键)。
-4. **凭证层**:先接 `claude setup-token` 长效 token;再做 keychain 读取 + `grant_type=refresh_token` 自动刷新(见凭证方案)。
-5. **测试**:授权公钥放行 / 未授权拒绝 / `session` 拒绝 / 目标白名单 / `-R` 拒绝 / 端到端 `claude` 跑通。
-6. **文档**:README 增补「转发-only SSH 模式」使用说明。
+**已完成**
+
+1. **`sshfwd.go`**:SSH server + `PublicKeyCallback` + channel 分发(`direct-tcpip` / `direct-streamlocal` / 其余 Reject)+ host key 加载/自动生成 + `authorized_keys` 热重载。
+2. **wiring**:SSH 是常开的唯一入口;转发 channel 不落地、不拨号,在进程内直接包装成
+   `net.Conn` 交给 HTTP Server,网关不监听任何 HTTP 端口。
+3. **`tlsterm.go`**:自建 CA + 现签 `api.anthropic.com` 叶证书,支持 `ANTHROPIC_UNIX_SOCKET`
+   形态;首字节嗅探自动区分明文与 TLS(见 §12)。
+4. **接入流程**:`add-device.sh`(管理员侧)/ `setup-device.sh`(设备侧),设备零网关登录权限(见 §9.5)。
+5. **测试**:授权公钥放行 / 未授权拒绝 / `session` 拒绝 / 目标白名单 / `-R` 拒绝 /
+   TLS 终结与身份透传 / CA 生成与复用 / 端到端 `claude` 跑通。
+
+**未做(独立议题)**
+
+6. **并发闸门**:单账号单飞/低并发限制器(反误杀关键)。目前网关不做任何配额/限流,用量仅打印。
+7. **凭证自动刷新**:现在贴的是 access token,会过期;稳妥做法是从 keychain 读 +
+   `grant_type=refresh_token` 自动刷新。
 
 ---
 
@@ -166,55 +176,53 @@ ccgw_ca_key.crt
 > 以一台新 Mac(设备 id `laptop-1`)接入为例。全程只在设备本地生成密钥,**私钥不外传**;
 > 网关只拿到公钥。设备端是**原生 `claude`**,不需要任何自定义头。
 
-**① 生成一把专用密钥对(不放 `~/.ssh`,放哪都行)**
+日常用 `scripts/setup-device.sh` + `scripts/add-device.sh` 即可(见 README「快速开始」)。
+这里写明它们背后做了什么,以及为什么这么分工。
+
+**① 设备本地生成专用密钥对**
 ```bash
-ssh-keygen -t ed25519 -f ~/keys/ccgw_laptop-1 -N "" -C "laptop-1"
-# 私钥 ~/keys/ccgw_laptop-1     ← 只留本机,别外传
-# 公钥 ~/keys/ccgw_laptop-1.pub ← 交给网关
+ssh-keygen -t ed25519 -f ~/.ccgw/ccgw_laptop-1 -N "" -C "laptop-1"
+# 私钥 ~/.ccgw/ccgw_laptop-1     ← 只留本机,别外传
+# 公钥 ~/.ccgw/ccgw_laptop-1.pub ← 交给管理员
 ```
 > `-N ""` 空密码免每次输;想更稳可去掉它设 passphrase。私钥自动 `0600`,ssh 只认权限不认目录。
+> 别在仓库目录里生成 —— 虽然 `.gitignore` 有 `ccgw_*` 兜底,但密钥就不该待在版本库旁边。
 
-**② 把公钥登记到网关**(在网关机改 `config.yaml`,把 `cat ~/keys/ccgw_laptop-1.pub` 的整行填进去)
-```yaml
-ssh:
-  authorized_keys:
-    - id: laptop-1
-      key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...  laptop-1"
-```
-改完让网关重载(增删设备无需重启)。
-
-**③ 配一个 SSH 别名**(写进 `~/.ssh/config` —— 这是配置不是密钥,放这没问题)
-```
-Host ccgw
-    HostName gateway-host          # 网关地址
-    Port 2222                      # 转发-only SSH 端口
-    User laptop-1                  # 与 config 里的 id 对应即可
-    IdentityFile ~/keys/ccgw_laptop-1
-    IdentitiesOnly yes             # 只用这把,避免 Too many authentication failures
-    LocalForward 8788 127.0.0.1:8788   # Level 1:本地 8788 → 网关 8788
-    RequestTTY no
-```
-> Level 2(unix socket):把 `LocalForward` 改成 `LocalForward /tmp/ccgw.sock /run/ccgw.sock`。
-
-**④ 首次连接核对 host key 指纹**(防 MITM 的关键一步)
+**② 管理员在网关机上登记**(设备**没有**登录网关机的权限,见 §9.5)
 ```bash
-ssh -N ccgw
-# The authenticity of host '[gateway-host]:2222' can't be established.
-# ED25519 key fingerprint is SHA256:xxxx...   ← 核对它 == 网关 host key 指纹,再 yes
+./scripts/add-device.sh laptop-1 "ssh-ed25519 AAAAC3Nz... laptop-1"
 ```
-> 网关侧用 `ssh-keygen -lf ssh_host_ed25519_key.pub` 打印指纹供比对。之后每次连,指纹不符 SSH 会直接拦。
+写进 `config.yaml` 的 `ssh.authorized_keys`,网关按 mtime 热重载,增删设备无需重启。
 
-**⑤ 起隧道 + 跑 claude**
+**③ 带外核对 host key 指纹**(防 MITM 的关键一步)
+
+管理员侧 `add-device.sh --list` 会打印指纹(等价于 `ssh-keygen -lf ssh_host_ed25519_key.pub`),
+通过当面/IM/邮件发给设备。设备侧用 `ssh-keyscan` 取到实际指纹后比对,不符即中止 ——
+**不要**直接 `yes` 接受未核对的指纹,那等于放弃 MITM 防护。
+
+**④ 建隧道**(同时开两个转发:明文口取 CA,socket 口跑 claude)
 ```bash
-ssh -N ccgw &                                     # 建隧道(后台)
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8788   # Level 1
-# Level 2 改为:export ANTHROPIC_UNIX_SOCKET=/tmp/ccgw.sock
-unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+ssh -N -L 8788:127.0.0.1:8788 -L $HOME/.ccgw.sock:/run/ccgw.sock \
+    -p 2222 -i ~/.ccgw/ccgw_laptop-1 \
+    -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
+    laptop-1@gateway-host &
+```
+> 也可以把这些写成 `~/.ssh/config` 里的 `Host` 别名(那是配置不是密钥,放 `~/.ssh` 没问题)。
+
+**⑤ 取 CA + 跑 claude**
+```bash
+curl -s http://127.0.0.1:8788/ca -o ~/.ccgw/ccgw_ca.crt   # 经已认证的隧道自取
+
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+export ANTHROPIC_UNIX_SOCKET=$HOME/.ccgw.sock
+export NODE_EXTRA_CA_CERTS=~/.ccgw/ccgw_ca.crt
+export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-placeholder   # 占位,网关不校验
 claude
 ```
+> 想用明文形态(不涉及 CA):`export ANTHROPIC_BASE_URL=http://127.0.0.1:8788` 代替上面两行。
 > 全新机器若被 onboarding 拦,按 README「绕过 onboarding」补 `hasCompletedOnboarding`/`theme` 两字段即可,无需真登录。
 
-**换机 / 疑似泄漏**:删掉 `config.yaml` 里对应 `authorized_keys` 项,这把 key 立即作废,其它设备不受影响。
+**换机 / 疑似泄漏**:`./scripts/add-device.sh --remove laptop-1`,这把 key 立即作废,其它设备不受影响。
 
 ---
 

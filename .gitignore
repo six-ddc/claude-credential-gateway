@@ -7,13 +7,27 @@ gateway.sh
 *.pem
 *.key
 
-# SSH host key(服务端私钥)
-ssh_host_ed25519_key
-ssh_host_ed25519_key.pub
+# SSH host key(服务端私钥;任何算法)
+ssh_host_*_key
+ssh_host_*_key.pub
 
-# TLS 终结 CA(私钥 + 分发给设备的证书)
-ccgw_ca_key
-ccgw_ca_key.crt
+# TLS 终结 CA 与设备密钥。
+# 设备私钥形如 ccgw_laptop-1 —— 没有扩展名,靠 *.key/*.pem 挡不住,所以整个前缀排除。
+# 证书(.crt)虽然不是密钥,但同属每个部署实例各不相同的运行时产物,一并排除。
+# 脚本默认把它们写到 ~/.ccgw/,但有人可能改路径或直接在仓库里 ssh-keygen,这条是兜底。
+ccgw_*
+
+# 误在仓库里生成的通用 ssh 密钥与主机记录
+id_ed25519*
+id_rsa*
+id_ecdsa*
+known_hosts*
+authorized_keys
+
+# 配置文件的其它拼写
+config.yml
+config.*.yaml
+config.*.yml
 
 # Go 构建产物
 /claude-credential-gateway
