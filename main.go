@@ -153,14 +153,20 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 明文 HTTP 经代理时是绝对形式请求(GET http://host/path)。目标不是我们打算
-	// 解密的主机就拒掉 —— 否则真凭证会被注入到一个跟 Anthropic 无关的目标上。
-	// (https 走 CONNECT,在上面就分流了,到不了这里。)
+	// 明文 HTTP 经代理时是绝对形式请求(GET http://host/path);https 走 CONNECT,
+	// 在连接层就分流了,到不了这里。按主机名决定怎么处理:
+	//   命中 mitm_hosts → 跟解密出来的请求一样,换上游 + 注入真凭证
+	//   命中 tunnel_hosts → 原样转给它,不注入(WebFetch 抓 http 站点走这条)
+	//   都不命中 → 403
+	inject := true
 	if r.URL.IsAbs() && !hostInList(cfg.Proxy.MITMHosts, hostnameOf(r.URL.Host)) {
-		writeError(w, 403, "host not permitted: "+r.URL.Host)
-		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "proxy_host",
-			"user": device, "host": r.URL.Host})
-		return
+		if !hostInList(cfg.Proxy.TunnelHosts, hostnameOf(r.URL.Host)) {
+			writeError(w, 403, "host not permitted: "+r.URL.Host)
+			audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "proxy_host",
+				"user": device, "host": r.URL.Host})
+			return
+		}
+		inject = false
 	}
 
 	body, err := io.ReadAll(r.Body)
@@ -173,25 +179,27 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// 2) 模型(仅审计;真正的 token 用量从响应解析)
 	reqModel := gjson.GetBytes(body, "model").String()
 
-	// 3) 上游 path —— 原样透传。
-	//    以前这里把非 /v1/ 的路径一律改写成 /v1/messages,于是 /api/oauth/usage
-	//    (/usage 命令查额度用的)会被悄悄换成一个 GET /v1/messages 打到上游,
-	//    客户端拿到的报错跟它请求的端点毫无关系,极难排查。代理形态下客户端
-	//    要打哪个端点就转哪个。
-	path := r.URL.RequestURI()
+	// 3) 目标 URL。注入路径下 path 原样透传 —— 客户端要打哪个端点就转哪个,
+	//    不做任何改写(/api/oauth/usage 这类非 /v1/ 端点全靠这一点才能通)。
+	target := upstreamURL.Scheme + "://" + upstreamURL.Host + r.URL.RequestURI()
+	if !inject {
+		target = r.URL.String()
+	}
 
-	// 4) 构造上游请求 —— 注入真凭证,剥掉客户端凭证企图
-	upReq, err := http.NewRequest(r.Method, upstreamURL.Scheme+"://"+upstreamURL.Host+path, bytes.NewReader(body))
+	// 4) 构造上游请求 —— 该注入的注入,客户端的凭证企图一律剥掉
+	upReq, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
 	if err != nil {
 		writeError(w, 502, "build upstream request failed")
 		return
 	}
-	upReq.Host = upstreamURL.Host
 
-	// 透明转发:保留客户端(真 Claude Code)拼好的所有头(betas/版本/UA/attestation 在 body),
-	// 只换 Host + Authorization(占位 → 真订阅 token)。
+	// 透明转发:保留客户端(真 Claude Code)拼好的所有头(betas/版本/UA/attestation 在 body)。
 	copyHeaders(upReq.Header, r.Header)
-	upReq.Header.Set("authorization", "Bearer "+cfg.Upstream.OAuth)
+	if inject {
+		// 只换 Host + Authorization(占位 → 真订阅 token)
+		upReq.Host = upstreamURL.Host
+		upReq.Header.Set("authorization", "Bearer "+cfg.Upstream.OAuth)
+	}
 
 	// 5) 转发到上游
 	upRes, err := httpClient.Do(upReq)
@@ -205,8 +213,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	status := upRes.StatusCode
 	audit(map[string]any{"ts": nowMs(), "ok": true, "user": device, "model": reqModel, "status": status})
 
-	// 被动采样订阅限额(5h/7d):每个响应都带这些头,零额外请求。
-	logRateLimit(sampleRateLimit(upRes.Header))
+	// 被动采样订阅限额(5h/7d):Anthropic 的每个响应都带这些头,零额外请求。
+	// 盲转发出去的第三方响应不看 —— 那些头要么没有,要么含义不同。
+	if inject {
+		logRateLimit(sampleRateLimit(upRes.Header))
+	}
 
 	// 复制响应头并写状态码
 	for k, vs := range upRes.Header {
@@ -229,8 +240,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[upstream %d] %s", status, text)
 		return
 	}
-	if u := extractUsage(decodeBody(buf.Bytes(), enc), upRes.Header.Get("content-type")); u != nil {
-		logUsage(device, reqModel, u)
+	// token 用量只从 Anthropic 的响应解析:第三方 JSON 里恰好有 model/usage 字段的话,
+	// 不加这层判断就会记成一笔莫须有的用量。
+	if inject {
+		if u := extractUsage(decodeBody(buf.Bytes(), enc), upRes.Header.Get("content-type")); u != nil {
+			logUsage(device, reqModel, u)
+		}
 	}
 }
 

@@ -1,17 +1,18 @@
-// proxy.go 实现 HTTP 正向代理形态(CONNECT),取代原先的 unix socket 形态。
+// proxy.go 实现 HTTP 正向代理形态(CONNECT),这是设备接入网关的传输层。
 //
-// 为什么要换:客户端设 ANTHROPIC_UNIX_SOCKET 时,只有 Anthropic SDK 那一条 fetch 路径
-// 会走 socket(utils/proxy.ts 的 getProxyFetchOptions 只在 forAnthropicAPI 时返回
-// {unix: path},而全仓只有 services/api/client.ts 传了这个参数)。/usage、/api/oauth/profile、
-// bootstrap 等一律走全局 axios,直连真实的 api.anthropic.com,根本进不了隧道。
+// 为什么是代理而不是 unix socket:客户端设 ANTHROPIC_UNIX_SOCKET 时,只有 Anthropic
+// SDK 那一条 fetch 路径会走 socket(utils/proxy.ts 的 getProxyFetchOptions 只在
+// forAnthropicAPI 时返回 {unix: path},而全仓只有 services/api/client.ts 传了这个参数)。
+// /usage、/api/oauth/profile、bootstrap 等一律走全局 axios,直连真实的 api.anthropic.com,
+// 根本进不了隧道。
 //
 // HTTPS_PROXY 则两条栈都覆盖:configureGlobalAgents() 既给全局 axios 装 interceptor,
 // 又 setGlobalDispatcher 装 undici 的 EnvHttpProxyAgent。这也是官方文档化的受支持配置
 // (Enterprise network configuration / LLM gateway 两页)。
 //
 // 代价是网关要说 HTTP 代理协议:客户端先发 CONNECT api.anthropic.com:443,
-// 我们回 200 之后才在这条连接上做 TLS 握手 —— 所以 TLS 终结这一步和以前一样,
-// 只是触发时机从「连上来就握手」变成「CONNECT 之后再握手」。
+// 网关回 200 之后才在这条连接上做 TLS 握手。TLS 终结本身照做(要解密才能换
+// Authorization),只是握手时机在 CONNECT 之后。
 package main
 
 import (

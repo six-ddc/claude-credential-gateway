@@ -12,8 +12,8 @@
 ## 工作原理
 
 ```
-设备(原生 claude,零自定义头)
-  │  ssh -N -L ... -p 2222 laptop-1@网关机     ← 唯一对外端口,公钥认证
+设备(原生 claude,HTTPS_PROXY 指向本地隧道口)
+  │  ssh -N -L 8788:127.0.0.1:8788 -p 2222 laptop-1@网关机   ← 唯一对外端口,公钥认证
   ▼
 转发-only SSH 层(:2222)
   · 公钥 → device id,这是唯一门禁
@@ -21,11 +21,13 @@
   · 无 shell / 无 exec / 无 pty,禁 -R 反向转发
   · host key pin 防 MITM
   ▼
-进程内网关 handler(转发 channel 直连,不监听任何 HTTP 端口)
-  · 剥掉客户端的凭证企图,注入真订阅 token
+进程内网关(转发 channel 直连,不监听任何 HTTP 端口)
+  · CONNECT api.anthropic.com → 就地 TLS 终结 → 剥掉客户端凭证、注入真订阅 token
+  · CONNECT 其它主机          → 纯 TCP 盲转发,不解密也不注入
+  · 普通 HTTP                 → GET /ca 取 CA、GET /status 看限额
   · per-device 审计 + 5h/7d 限额被动采样
   ▼
-api.anthropic.com
+api.anthropic.com(注入)/ 其它站点(盲转发)
 ```
 
 几个要点:
@@ -35,8 +37,28 @@ api.anthropic.com
 - **身份来自 SSH 公钥**,写进每个请求的 context,客户端伪造不了。设备台账的单一数据源就是
   `ssh.authorized_keys`。
 - **设备对网关机没有任何登录权限**,能做的只有建隧道。
+- **上游 path 原样透传**:客户端打哪个端点就转哪个(`/v1/messages`、`/api/oauth/usage`……),
+  网关只换 `Host` 和 `Authorization`。
 - 同时,网关会**打印每个请求的 model 与 token 使用量**(input / output / cache),用 `gjson`
   从上游响应解析,支持 SSE 流式与普通 JSON。
+
+### 为什么传输层是 HTTP 代理
+
+Claude Code 内部有**两条 HTTP 栈**:Anthropic SDK 走 undici/fetch,打 `/v1/messages`;
+`/usage` 查额度、`/api/oauth/profile`、bootstrap 这些一律走**全局 axios**。
+
+`ANTHROPIC_UNIX_SOCKET` 只在 `getProxyFetchOptions({ forAnthropicAPI: true })` 这一处生效,
+而全仓只有 SDK 的 client 传了这个参数 —— 也就是说它只能盖住 `/v1/messages`,其余端点会直连
+真实的 `api.anthropic.com`,根本进不了隧道。
+
+`HTTPS_PROXY` 则两条栈都覆盖:客户端启动时的 `configureGlobalAgents()` 既给全局 axios 装
+interceptor,又 `setGlobalDispatcher` 给 undici 装 `EnvHttpProxyAgent`。这也是 Claude Code
+官方文档化的受支持配置(Enterprise network configuration 与 LLM gateway 两页明文支持
+`HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`、自定义 CA、mTLS)。
+
+代价是网关要会说 HTTP 代理协议:客户端先发 `CONNECT api.anthropic.com:443`,网关回
+`200 Connection Established`,之后才在这条连接上做 TLS 握手 —— TLS 终结这一步该干的活不变,
+只是触发时机从「连上来就握手」变成「CONNECT 之后再握手」。
 
 ## 技术栈
 
@@ -60,6 +82,11 @@ cp config.example.yaml config.yaml        # config.yaml 已在 .gitignore,改它
 upstream:
   base: https://api.anthropic.com
   oauth: ""               # 你订阅的真 access token;留空则用 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入
+proxy:                    # 正向代理:设备侧 HTTPS_PROXY 指向隧道口
+  mitm_hosts:                         # 解密并注入真凭证的主机 —— 只该放 Anthropic API 本身
+    - api.anthropic.com
+  tunnel_hosts:                       # 只做 TCP 盲转发、不解密也不注入的主机
+    - "*"
 ssh:                      # 唯一对外入口;设备台账的单一数据源
   addr: ":2222"                       # 唯一对外端口
   host_key: ./ssh_host_ed25519_key    # 服务端私钥;不存在则首启自动生成
@@ -72,9 +99,19 @@ ssh:                      # 唯一对外入口;设备台账的单一数据源
       key: "ssh-ed25519 AAAA... laptop-1"
 ```
 
+`mitm_hosts` / `tunnel_hosts` 都支持三种写法:`*`(任意主机)、`*.example.com`(子域,不含
+`example.com` 自身)、精确主机名。两个名单都不命中的 `CONNECT` 直接 403。
+
+- **`mitm_hosts` 决定真凭证会被送到哪儿**,多放一个域名就等于把订阅 token 交给那个域名,
+  所以默认也只有 `api.anthropic.com`(客户端无论怎么配,URL 里的主机名始终是它)。
+- **`tunnel_hosts` 决定其余流量能出到哪儿**。设备设了 `HTTPS_PROXY` 之后,客户端的全部 HTTPS
+  流量(遥测、WebFetch 抓的任意站点、MCP server)都会经过网关。默认 `"*"` 全放行:设备已经过
+  SSH 公钥认证,而收紧它会直接弄坏 WebFetch 这类功能。要收紧就把 `"*"` 换成具体域名列表。
+
 配置路径优先级:`GATEWAY_CONFIG` 指定 > 本地 `config.yaml` > `config.example.yaml`(模板,并提示拷贝)。
 
 可用环境变量覆盖:`GATEWAY_UPSTREAM_BASE`、`CLAUDE_GATEWAY_UPSTREAM_OAUTH`、
+`GATEWAY_PROXY_MITM_HOSTS`、`GATEWAY_PROXY_TUNNEL_HOSTS`(均逗号分隔)、
 `GATEWAY_SSH_ADDR`、`GATEWAY_SSH_HOST_KEY`、`GATEWAY_SSH_CA_KEY`、
 `GATEWAY_SSH_PERMIT_TARGETS`(逗号分隔)、`GATEWAY_SSH_AUTHORIZED_KEYS`(JSON `[{id,key}]`)。
 
@@ -124,8 +161,9 @@ GATEWAY_HOST=你的网关 GATEWAY_HOST_KEY_FP='SHA256:xxxx' \
   ./scripts/setup-device.sh laptop-1
 ```
 
-脚本会核对指纹(不符即中止)、建隧道、经隧道自取 CA 证书、验证链路、检查 Claude Code 版本,
-最后生成一个**包装命令** `~/.ccgw/bin/ccgw` —— 那一堆 `unset`/`export` 都收在里面,不用手敲:
+脚本会核对指纹(不符即中止)、建隧道、经隧道自取 CA 证书、经代理验证链路、检查 Claude Code 版本、
+写占位凭证,最后生成一个**包装命令** `~/.ccgw/bin/ccgw` —— 那一堆 `unset`/`export` 都收在里面,
+不用手敲:
 
 ```bash
 export PATH="$HOME/.ccgw/bin:$PATH"    # 加进 ~/.zshrc 或 ~/.bashrc,一次即可
@@ -146,78 +184,80 @@ ccgw -p "写个快排"                      # 参数原样透传
 
 ```bash
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
-export ANTHROPIC_UNIX_SOCKET=$HOME/.ccgw-laptop-1.sock
+unset ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN
+export HTTPS_PROXY=http://127.0.0.1:8788   HTTP_PROXY=http://127.0.0.1:8788
+export https_proxy=http://127.0.0.1:8788   http_proxy=http://127.0.0.1:8788
 export NODE_EXTRA_CA_CERTS=$HOME/.ccgw/ccgw_ca.crt
-export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-placeholder'
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CONFIG_DIR=$HOME/.ccgw/claude-home
 exec claude "$@"
 ```
 
-外加两个启动前自检:socket 不在就提示「重跑 setup-device.sh 建隧道」,CA 缺失同理 ——
+外加两个启动前自检:代理口连不上就提示「重跑 setup-device.sh 建隧道」,CA 缺失同理 ——
 比让 `claude` 抛一个含糊的连接错误好定位。
 
 > 设备密钥与 CA 存 `~/.ccgw/`(不进仓库)。隧道断了重跑脚本即可,包装命令会一并重建。
 >
 > **占位凭证不能省**:`claude` 自己要求手里有凭证才肯启动,什么都不设会停在
 > `Not logged in · Please run /login`。网关不校验它、只覆盖,所有设备填同一个假值即可。
-> `CLAUDE_CODE_OAUTH_TOKEN` 与 `ANTHROPIC_API_KEY` 设哪个都能跑(网关会剥掉客户端的
-> `x-api-key` 再注入真凭证),但**建议用前者** —— 它让客户端走订阅分支、带上 `oauth-2025`
-> beta 头,与网关注入的订阅 token 形状一致,这也是官方 `claude ssh` 的做法。
+> 脚本把它写成**凭证文件** `$CLAUDE_CONFIG_DIR/.credentials.json`:
 >
-> **旁路流量要关**:`ANTHROPIC_UNIX_SOCKET`/`ANTHROPIC_BASE_URL` 只接管 API 主链路;遥测
-> (`event_logging/batch`)和 GrowthBook 特性开关拉取是独立的直连请求,从设备**真实 IP** 发出
-> (GrowthBook 那路还会把占位 token 以 Bearer 带给 `api.anthropic.com`,虽被 401 但暴露 IP)。
-> `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 让客户端进入 essential-traffic 模式,这些请求
-> **在源头就不发**,顺带禁掉错误上报、`/feedback`、DesignSync、Projects、自动更新检查等依赖
-> claude.ai 的功能。若只想关遥测但保留这些功能,退一档用 `DISABLE_TELEMETRY=1` —— 源码里
-> GrowthBook 拉取以「遥测未关」为前提,所以它同样会停,只是错误上报、更新检查等仍直连。
+> ```json
+> {"claudeAiOauth":{"accessToken":"sk-ant-oat01-placeholder","expiresAt":4102444800000,
+>   "scopes":["user:inference","user:profile"],"subscriptionType":"max"}}
+> ```
 >
-> **客户端版本下限 `>= 2.1.197`**:脚本会检查 `claude --version`,低于就告警(不中止 ——
-> 隧道本身已经好了)。v2.1.91(2026-04-02)~v2.1.196 的客户端在设了 `ANTHROPIC_BASE_URL` 时,
-> 会读系统时区、提取代理主机名与两份加密列表比对,再把结果隐写进系统提示词
-> `Today's date is ...` 那一行(日期分隔符 `-`↔`/`,撇号在 U+0027/2019/02BC/02B9 间切换)发给上游;
-> 官方 v2.1.197 已移除。**socket 形态不设 `ANTHROPIC_BASE_URL`,本就不在触发面上**,但明文调试
-> 形态会;且网关是透明转发、不改写请求体,客户端埋进 body 的任何标记都会绑着真凭证送达上游。
-> 详见 [docs/anthropic-unix-socket.md](docs/anthropic-unix-socket.md)。用
-> `MIN_CLAUDE_VERSION=x.y.z` 可覆盖这个下限。
+> **要用文件而不是 `CLAUDE_CODE_OAUTH_TOKEN`**:设了那个环境变量,客户端就走 env token 分支,
+> scopes 被硬编码成只有 `user:inference`、凭证文件根本不读;而 `/usage` 要求 scopes 含 `user:profile`,
+> 拿不到就直接返回空、连请求都不发。写文件才能自己定 scopes,`/usage` 才有数据。
+> 不给 `refreshToken`、`expiresAt` 设到 2100 年,两条各自都能让客户端不去刷新(拿占位 token
+> 刷新必然失败,还要重试拖慢启动)。
+>
+> **凭证放独立的 `CLAUDE_CONFIG_DIR`**(`~/.ccgw/claude-home`),完全不碰你真的
+> `~/.claude/.credentials.json`。与凭证无关的东西(`settings.json`、`CLAUDE.md`、`commands`、
+> `agents`、`skills`、`plugins`、`projects`、`todos`、`statsig`)由脚本用**符号链接**从真
+> `~/.claude` 接过来,设置、记忆和历史都还在。
+>
+> **客户端版本下限 `>= 2.1.197`**:脚本会检查 `claude --version`,低于就**直接中止**。
+> v2.1.91(2026-04-02)~v2.1.196 的客户端一旦发现配了代理,就会读系统时区、提取代理主机名与
+> 两份加密列表比对,再把结果隐写进系统提示词 `Today's date is ...` 那一行(日期分隔符 `-`↔`/`,
+> 撇号在 U+0027/2019/02BC/02B9 间切换)发给上游;官方 v2.1.197 已移除。代理形态下**每次调用都
+> 命中**这条,而网关是透明转发、不改写请求体,客户端埋进 body 的任何标记都会绑着真凭证送达上游。
+> 详见 [docs/transport.md](docs/transport.md)。`MIN_CLAUDE_VERSION=x.y.z`
+> 可覆盖这个下限,`ALLOW_OLD_CLAUDE=1` 可强行放行(自担后果)。
+>
+> **设备的全部 HTTPS 流量都从网关出去**。遥测、WebFetch、MCP 也都走这条代理,没有绕开网关、
+> 从设备真实 IP 发出的旁路,所以不需要再去关非必要流量;放行范围由 `proxy.tunnel_hosts` 决定。
 
-## 两种传输形态
+## 隧道口上跑的是什么
 
-网关**同时**支持两种,靠首字节嗅探自动区分(TLS 记录以 `0x16` 开头),不需要任何配置开关。
+设备侧只有**一个本地端口**(默认 `127.0.0.1:8788`),它同时当代理入口和取 CA 的明文口。网关按
+连接开头的字节自动分辨,不需要任何配置开关:
 
-**① unix socket + TLS(脚本默认,推荐)** —— 复刻官方 `claude ssh` 的传输形态。本机不开
-TCP 端口,socket 文件 `0600` 只有你自己能连。
+| 开头字节 | 当作什么 | 谁在用 |
+|---|---|---|
+| `CONNECT ` | HTTP 代理协议 | `HTTPS_PROXY` 指向它,claude 的全部 HTTPS 流量 |
+| `0x16` | 直接 TLS 握手 | TLS 记录的第一个字节 |
+| 其它 | 普通 HTTP | `GET /ca` 取 CA、`GET /status` 看限额 |
 
-Claude Code 设了 `ANTHROPIC_UNIX_SOCKET` 后,只把**传输层**换成 unix socket,**目标 URL 仍是
-`https://api.anthropic.com`,照常发起完整 TLS 握手**。所以网关必须自己终结 TLS 才能读到明文
-HTTP 去替换 `Authorization`:它用自建 CA 现签一张 `api.anthropic.com` 证书,设备用
-`NODE_EXTRA_CA_CERTS` 信任这把 CA 即可。
+`CONNECT` 到 `mitm_hosts` 里的主机时,网关回 `200 Connection Established` 之后**就地终结 TLS**:
+它用自建 CA 现签一张 `api.anthropic.com` 证书,设备用 `NODE_EXTRA_CA_CERTS` 信任这把 CA 即可;
+解密出来的请求走正常的注入 + 转发流程。`CONNECT` 到 `tunnel_hosts` 的主机则是纯 TCP 对拷,
+网关不解密也不注入。两个名单都不命中的,直接 403。
 
-**② 明文 HTTP(调试友好)** —— 用 `ANTHROPIC_BASE_URL` 指向隧道本地口,不涉及 CA:
+明文 `http://` 走代理时是绝对形式请求(`GET http://host/path`),按同样两个名单分流:
+命中 `mitm_hosts` 的换上游并注入真凭证,命中 `tunnel_hosts` 的原样转过去、**不注入**
+(WebFetch 抓 http 站点走这条),都不命中才 403。真凭证只会进 `mitm_hosts` 里的主机。
+
+限额快照两种拿法都行:
 
 ```bash
-ssh -N -L 8788:127.0.0.1:8788 -p 2222 -i ~/.ccgw/ccgw_laptop-1 laptop-1@网关机 &
-unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_UNIX_SOCKET
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
-export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-placeholder'
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-claude
+curl http://127.0.0.1:8788/status                                   # 明文口
+curl -x http://127.0.0.1:8788 --cacert ~/.ccgw/ccgw_ca.crt \
+     https://api.anthropic.com/status                               # 经代理,顺带验证整条链路
 ```
 
-`ANTHROPIC_BASE_URL` 在这个形态下**不能省** —— 不设它,`claude` 会拿占位 token 直连官方 API,
-直接 401,网关被整个绕过。
-
-> **明文形态请只当调试用**,暴露面严格大于 socket 形态:它必须设 `ANTHROPIC_BASE_URL`,而客户端
-> 里若干逻辑正是以「设了非官方 base URL」为入口 —— 比如 GrowthBook 用户属性里的
-> `apiBaseUrlHost`(把代理主机名连同 deviceId/accountUUID/email 一起上报,v2.1.220 仍在),
-> 以及旧版那套隐写标记。socket 形态下 `ANTHROPIC_BASE_URL` 未设,这些分支取不到值。
-> 日常请用脚本生成的 `ccgw`(socket 形态)。
-
-> 两种形态下 `-L` 右边的目标(`127.0.0.1:8788` / `/run/ccgw.sock`)都必须在网关
-> `ssh.permit_targets` 里。它们只是白名单口令,网关并不真监听这些地址。
->
-> 限额快照:socket 形态 `curl --unix-socket $SOCK --cacert $CA https://api.anthropic.com/status`;
-> 明文形态 `curl http://127.0.0.1:8788/status`。
+> `-L` 右边的目标(`127.0.0.1:8788`)必须在网关 `ssh.permit_targets` 里。它只是白名单口令,
+> 网关并不真监听这个地址;左边的本地端口随便改(`LOCAL_PROXY_PORT`)。
 
 ### 手动接入(不用脚本)
 
@@ -225,9 +265,8 @@ claude
 # ① 设备本地生成密钥,把 .pub 交给管理员登记(见「快速开始」③)
 ssh-keygen -t ed25519 -f ~/.ccgw/ccgw_laptop-1 -N "" -C laptop-1
 
-# ② 核对指纹后建隧道(两个转发:明文口取 CA,socket 口跑 claude)
-ssh -N -L 8788:127.0.0.1:8788 -L $HOME/.ccgw.sock:/run/ccgw.sock \
-    -p 2222 -i ~/.ccgw/ccgw_laptop-1 laptop-1@网关机 &
+# ② 核对指纹后建隧道(一个转发就够,代理和取 CA 共用这个口)
+ssh -N -L 8788:127.0.0.1:8788 -p 2222 -i ~/.ccgw/ccgw_laptop-1 laptop-1@网关机 &
 
 # ③ 经【已认证的隧道】自取 CA —— 不需要、也不该有登录网关机的权限
 curl -s http://127.0.0.1:8788/ca -o ~/.ccgw/ccgw_ca.crt
@@ -236,14 +275,14 @@ curl -s http://127.0.0.1:8788/ca -o ~/.ccgw/ccgw_ca.crt
 > CA 之所以能自取而 host key 指纹不能:建隧道时 SSH 已用 host key 认证了服务端身份,隧道内的
 > 字节可信;而指纹是这条信任链的**起点**,不能从还没建立的链里取。
 >
-> `GET /ca` 走明文口是因为 socket 那一路要先验 TLS 证书,而证书正是要取的东西。明文口在 SSH
-> 隧道内,安全性由 SSH 保证。
+> `GET /ca` 走明文口是因为代理那一路要先验 TLS 证书,而证书正是要取的东西。明文口在 SSH
+> 隧道内,机密性和完整性由 SSH 保证。
 
 ## 首次初始化:跳过交互式引导
 
-**全新机器、或 `claude logout` 之后,光设占位 token 不够用** —— Claude Code 检测到没完成
-onboarding 会进入首次运行引导,而里面的登录步骤**不会因为设了 token 就被跳过**。表现:明明设了
-占位 token,`claude` 还是要你去浏览器登录账号。
+**全新机器、或 `claude logout` 之后,光有占位凭证不够用** —— Claude Code 检测到没完成
+onboarding 会进入首次运行引导,而里面的登录步骤**不会因为手里有凭证就被跳过**。表现:占位凭证
+明明写好了,`claude` 还是要你去浏览器登录账号。
 
 > 说明:这里跳过的只是**首次运行的交互式 UI 引导**(选主题那一步),不涉及绕过任何鉴权或计费 ——
 > 真正的鉴权发生在网关注入你自己订阅凭证的那一刻,用的仍是你自己付费的订阅。
@@ -251,18 +290,19 @@ onboarding 会进入首次运行引导,而里面的登录步骤**不会因为设
 触发条件是 `!theme || !hasCompletedOnboarding`,**两个字段缺一个就触发**。所以在客户端预置好这两个
 字段即可绕过,完全不需要真账号登录:
 
-**1) 先定位对的全局配置文件**(不是 `~/.claude/` 目录里的文件,常见的是 `~/.claude.json`):
+**1) 先定位对的全局配置文件**。`ccgw` 把 `CLAUDE_CONFIG_DIR` 指向 `~/.ccgw/claude-home`,
+所以它读的是**那个目录里**的文件,而不是你平时用的 `~/.claude.json` —— 哪怕真 `~` 下早就
+onboard 过,`ccgw` 第一次跑仍可能被拦:
 
 ```bash
-echo "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
-ls -la ~/.claude.json ~/.claude/.config.json "$CLAUDE_CONFIG_DIR/.claude.json" 2>/dev/null
+ls -la ~/.ccgw/claude-home/.claude.json ~/.ccgw/claude-home/.config.json 2>/dev/null
 ```
 
 解析优先级(对应 Claude Code 的 `getGlobalClaudeFile()`):
-- 若存在 `<CLAUDE_CONFIG_DIR 或 ~/.claude>/.config.json` → **它优先**(老版本路径,改 `~/.claude.json` 就没用);
-- 否则 → `(CLAUDE_CONFIG_DIR || ~)/.claude.json`(最常见)。
+- 若存在 `<CLAUDE_CONFIG_DIR 或 ~/.claude>/.config.json` → **它优先**(老版本路径);
+- 否则 → `(CLAUDE_CONFIG_DIR || ~)/.claude.json`,`ccgw` 形态下即 `~/.ccgw/claude-home/.claude.json`。
 
-> 常见踩坑:把 `hasCompletedOnboarding` 写进了 `~/.claude/settings.json` —— 那是 settings,schema 不同,
+> 常见踩坑:把 `hasCompletedOnboarding` 写进了 `settings.json` —— 那是 settings,schema 不同,
 > **没有这个字段**,写了也不生效。
 
 **2) 往上一步定位到的文件里补两个字段**(文件已存在就合并进去,别覆盖掉原有的 theme 等):
@@ -277,12 +317,12 @@ ls -la ~/.claude.json ~/.claude/.config.json "$CLAUDE_CONFIG_DIR/.claude.json" 2
 手懒可以用 `jq` 安全合并(把 `$F` 换成第 1 步定位到的文件;文件不存在会新建):
 
 ```bash
-F=~/.claude.json
+F=~/.ccgw/claude-home/.claude.json
 [ -f "$F" ] || echo '{}' > "$F"
 jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 ```
 
-之后再按「快速开始 ④」设好环境变量跑 `claude`,就能直接用、不再要求登录账号。
+之后再跑 `ccgw`,就能直接用、不再要求登录账号。
 
 ## Token 用量日志
 
@@ -298,6 +338,20 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
 
 > 网关不做任何配额/限流;用量仅打印,不拦截。
 
+## 查额度
+
+设备上直接用 `/usage`:它打的是 `GET /api/oauth/usage`(客户端走全局 axios 的端点),代理把这条
+也送进隧道,网关按 path 原样转给上游并注入真凭证 —— 于是设备看到的是**你订阅账号的真实额度**。
+
+两个前提缺一不可,`ccgw` 都替你处理好了:
+
+- 占位凭证的 scopes 含 `user:profile`。少了它客户端**连请求都不发**,面板显示
+  "only available for subscription plans";
+- 环境里没有 `CLAUDE_CODE_OAUTH_TOKEN`。设了它就走 env token 分支,scopes 退回 inference-only。
+
+不进客户端也能看:`curl http://127.0.0.1:8788/status` 给的是网关**被动采样**的 5h/7d 限额快照
+(从上游响应头取,零额外请求),还没转发过任何请求时返回 `{}`。
+
 ## 运维
 
 - **加设备**:设备跑 `setup-device.sh` 拿公钥 → 管理员 `add-device.sh <id> "<公钥>"` → 热重载即生效。
@@ -305,7 +359,9 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
 - **host key 轮换**:换掉 `ssh_host_ed25519_key` 重启 → 把新指纹带外发给各设备,设备重跑
   `setup-device.sh`(会更新 `known_hosts`)。
 - **CA 轮换**:删掉 `ccgw_ca_key`(含 `.crt`)重启自动生成 → 设备重跑脚本重新取 CA。
-  只影响 socket 形态。
+  旧 CA 还留在设备上的话,`ccgw` 会报证书错误。
+- **收紧出口**:改 `proxy.tunnel_hosts`(或 `GATEWAY_PROXY_TUNNEL_HOSTS`)。注意收得太紧会
+  弄坏 WebFetch 和 MCP —— 它们的流量也从这条代理出去。
 
 ## 安全与合规边界
 
@@ -319,6 +375,11 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
   凭证隔离当场失效。所以登记设备由管理员在网关侧做,设备只会建隧道。
 - **CA 私钥比 host key 更敏感**:拿到 `ccgw_ca_key` 就能对任何信任该 CA 的设备伪造
   `api.anthropic.com`。它只该待在网关机上;分发给设备的 `.crt` 不是密钥。
+- **网关同时是设备的出口代理**。设备设了 `HTTPS_PROXY` 之后,claude 的全部 HTTPS 流量都从网关
+  出去,别人看到的是网关机的 IP,网关机也承担这部分流量。`tunnel_hosts` 是唯一的闸门,默认
+  `"*"` 等于对已认证设备全放行 —— 在意的话就换成白名单。
+- **`mitm_hosts` 就是「真凭证送给谁」的名单**。往里加域名等于把订阅 token 交给那个域名,
+  除了 `api.anthropic.com` 不该有别的。盲转发那条路不解密、也不会碰到凭证。
 - **真凭证只走环境变量。** 别把 token 写进提交的文件;含明文 token 的本地启动脚本(如 `gateway.sh`)
   与本地 `config.yaml` 都已在 `.gitignore` 中。
 - **token 续期**:网关里只贴 access token 会几小时过期;稳妥做法是网关机器正常登录、由网关从

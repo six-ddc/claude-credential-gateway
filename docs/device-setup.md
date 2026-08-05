@@ -5,8 +5,12 @@
 
 > 全程你**不需要、也不会拿到**登录网关机的权限。设备能做的只有建一条隧道。
 >
-> 网关管理员侧的部署看 [README](../README.md#快速开始)；技术原理看
-> [anthropic-unix-socket.md](./anthropic-unix-socket.md)。
+> 跑完之后你会得到一个 `ccgw` 命令：用法和 `claude` 一模一样，额度算在网关那个订阅上，
+> `/usage` 也能正常看到剩余额度。
+>
+> 网关管理员侧的部署看 [README](../README.md#快速开始)；隧道口上跑什么协议看
+> [README「隧道口上跑的是什么」](../README.md#隧道口上跑的是什么)；客户端行为的源码依据看
+> [transport.md](./transport.md)。
 
 ---
 
@@ -50,10 +54,10 @@ command -v claude        # 顺便看看装在哪、是哪种安装方式
 |---|---|
 | 输出 `未安装` | 按下面「首次安装」装一份 |
 | 版本 **≥ 2.1.197** | ✅ 什么都不用做，直接进第 1 步 |
-| 版本 **< 2.1.197** | 按下面「升级」升一下 |
+| 版本 **< 2.1.197** | 按下面「升级」升一下，**这是硬性要求** |
 
-> 记不住版本号也没关系：`setup-device.sh` 跑到第 ⑥ 步会自己检查并告警，
-> 而且**只告警不中止**——隧道该建还是会建好。
+> 记不住版本号没关系：`setup-device.sh` 会自己检查。但注意低于 2.1.197 **脚本直接中止**，
+> 不是告警——原因见本节末尾。
 
 **首次安装**（挑一种，别混着来）：
 
@@ -80,13 +84,11 @@ claude doctor            # 升级完不放心可以体检一下安装状态
 | mise | `mise upgrade claude` |
 | winget | `winget upgrade Anthropic.ClaudeCode` |
 
-> ⚠️ **注意自动更新会失效**：`ccgw` 会设 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`，
-> 这个开关连带把「检查新版本」的网络请求也停掉了（它本来就是要断掉一切非必要外连）。
-> 所以**只用 `ccgw` 的话，客户端不会再自动更新**，得偶尔手动 `claude update` 一下。
-
-**为什么要卡 2.1.197 这个版本**：v2.1.91 ~ v2.1.196 的客户端在设了 `ANTHROPIC_BASE_URL` 时，
-会读系统时区、提取代理主机名，把比对结果隐写进系统提示词发给上游；官方 v2.1.197 已移除。
-本教程用的 socket 形态不设 `ANTHROPIC_BASE_URL`，本就不在触发面上，但统一卡版本最省心。
+**为什么卡在 2.1.197**：v2.1.91 ~ v2.1.196 的客户端一旦发现配了代理，就会读系统时区、
+提取代理主机名，把比对结果隐写进系统提示词 `Today's date is ...` 那一行发给上游（官方
+v2.1.197 已移除）。`ccgw` 靠 `HTTPS_PROXY` 接管流量，这条**每次调用都会命中**，所以脚本
+不放行低版本。确实要用旧版就 `ALLOW_OLD_CLAUDE=1 ./scripts/setup-device.sh laptop-1`，
+后果自负。
 
 ### 拿到接入脚本
 
@@ -117,7 +119,7 @@ GATEWAY_HOST=gateway.example.com ./scripts/setup-device.sh laptop-1
 ```
 == 设备 id: laptop-1
 == 网关: gateway.example.com:2222
-== 已生成密钥: /Users/you/.ccgw/ccgw_laptop-1(私钥只留本机)
+== 已生成密钥: ~/.ccgw/ccgw_laptop-1(私钥只留本机)
 ⚠ 未提供 GATEWAY_HOST_KEY_FP,按 TOFU 接受。请与管理员人工核对:
      SHA256:abc123...
 
@@ -168,18 +170,23 @@ GATEWAY_HOST_KEY_FP='SHA256:abc123defg456...' \
 == 设备 id: laptop-1
 == 网关: gateway.example.com:2222
 == host key 指纹已核对: SHA256:abc123defg456...
-== 隧道已建立: 127.0.0.1:8788(明文)、/Users/you/.ccgw-laptop-1.sock(TLS)→ gateway.example.com:2222
-== 网关 CA: /Users/you/.ccgw/ccgw_ca.crt (CN=claude-credential-gateway CA)
+== 隧道已建立: 127.0.0.1:8788 → gateway.example.com:2222
+== 网关 CA: ~/.ccgw/ccgw_ca.crt (CN=claude-credential-gateway CA)
 == /status: {}
-== Claude Code 版本: 2.1.220 (>= 2.1.197,OK)
-== 已生成包装命令: /Users/you/.ccgw/bin/ccgw
+== Claude Code 版本: 2.1.222 (>= 2.1.197,OK)
+== 占位凭证: ~/.ccgw/claude-home/.credentials.json (scopes 含 user:profile,/usage 才肯发请求)
+== 已生成包装命令: ~/.ccgw/bin/ccgw
 ```
 
-脚本这一趟做了 7 件事：核对指纹并 pin → 建隧道（两个转发）→ 经隧道自取 CA 证书 →
-打 `/status` 验证链路 → 检查 claude 版本 → 生成包装命令 → 打印下一步。
+脚本这一趟做了 8 件事：核对指纹并 pin → 建隧道（一个本地端口）→ 经隧道自取 CA 证书 →
+**经代理**打一次 `https://api.anthropic.com/status` 验证整条链路 → 检查 claude 版本 →
+写占位凭证 → 生成包装命令 → 打印下一步。
 
 > `== /status: {}` 是**正常的**。网关还没转发过真实请求时没有限额快照可报，就回空对象。
 > 用过一阵之后这里会显示 5h/7d 的剩余额度。
+
+> 那一个本地端口（默认 `127.0.0.1:8788`）身兼两职：`ccgw` 的 `HTTPS_PROXY` 指向它，
+> 取 CA 和查 `/status` 的普通 HTTP 请求也打它。网关按连接开头的字节自动分辨。
 
 **指纹不符会直接中止**，这是它该做的：
 
@@ -213,6 +220,9 @@ ccgw --version
 
 **真的 `claude` 命令不受影响**，仍然直连官方。两者可以并存，互不干扰。
 
+交互式里敲 `/usage` 能看到网关那个订阅的剩余额度（5h / 7d 那几条）——它依赖脚本写的占位凭证里
+带了 `user:profile` scope，详见 [§7 环境变量速查](#7-环境变量速查)。
+
 > 只想要交互式 shell 里的别名也行：`alias ccgw="$HOME/.ccgw/bin/ccgw"`。
 > 但推荐 PATH 形态——别名在脚本、`make`、编辑器插件等子进程里**不生效**。
 >
@@ -231,26 +241,33 @@ ccgw --version
 
 触发条件是 `!theme || !hasCompletedOnboarding`，**两个字段缺一个就触发**。
 
-**第 1 步，先定位对的配置文件**（不是 `~/.claude/settings.json`）：
+**第 1 步，先定位对的配置文件**。`ccgw` 把 `CLAUDE_CONFIG_DIR` 指向 `~/.ccgw/claude-home`，
+所以它读的是**那个目录里**的 `.claude.json`，跟你平时用的 `~/.claude.json` 不是同一个文件——
+哪怕你早就用真 `claude` 登录过，第一次跑 `ccgw` 照样可能被引导拦下：
 
 ```bash
-echo "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
-ls -la ~/.claude.json ~/.claude/.config.json "$CLAUDE_CONFIG_DIR/.claude.json" 2>/dev/null
+ls -la ~/.ccgw/claude-home/.claude.json ~/.ccgw/claude-home/.config.json 2>/dev/null
 ```
 
 优先级：存在 `<CLAUDE_CONFIG_DIR 或 ~/.claude>/.config.json` → **它优先**；否则
-→ `(CLAUDE_CONFIG_DIR || ~)/.claude.json`（最常见）。
+→ `(CLAUDE_CONFIG_DIR || ~)/.claude.json`，`ccgw` 形态下就是 `~/.ccgw/claude-home/.claude.json`。
 
 **第 2 步，补两个字段**（用 `jq` 安全合并，不会覆盖已有内容）：
 
 ```bash
-F=~/.claude.json            # 换成上一步定位到的文件
+F=~/.ccgw/claude-home/.claude.json     # 换成上一步定位到的文件
 [ -f "$F" ] || echo '{}' > "$F"
 jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 ```
 
-> **常见踩坑**：把 `hasCompletedOnboarding` 写进了 `~/.claude/settings.json`。那是 settings，
+> **常见踩坑**：把 `hasCompletedOnboarding` 写进了 `settings.json`。那是 settings，
 > schema 不同，**根本没有这个字段**，写了也不生效。
+
+> 同理，`.claude.json` 里记的东西（「信任这个目录吗」的应答、`~/.claude.json` 级的 MCP 配置等）
+> `ccgw` 和真 `claude` 各记各的，第一次进某个目录可能要再确认一次信任。
+> 而 `settings.json`、`CLAUDE.md`、`commands`、`agents`、`skills`、`plugins`、`projects`、
+> `todos`、`statsig` 是脚本用符号链接从真 `~/.claude` 接过来的，设置和会话历史都还在，
+> 那边改了这边立刻跟着变。
 
 ---
 
@@ -290,22 +307,24 @@ GATEWAY_HOST_KEY_FP='SHA256:abc...' \
 # ① 看 ssh 进程还在不在
 pgrep -fl "ccgw_laptop-1"
 
-# ② 真正打一次链路（最可靠）
-curl -s --unix-socket ~/.ccgw-laptop-1.sock --cacert ~/.ccgw/ccgw_ca.crt \
+# ② 打一下明文口（最轻）
+curl -s http://127.0.0.1:8788/status
+
+# ③ 完整走一遍客户端要走的路：代理 + TLS 终结 + 校验网关 CA（最可靠）
+curl -s -x http://127.0.0.1:8788 --cacert ~/.ccgw/ccgw_ca.crt \
      https://api.anthropic.com/status
 ```
 
-> ⚠️ **socket 文件存在 ≠ 隧道活着**。ssh 进程被 `kill -9` 时可能留下僵尸 socket 文件，
-> 此时 `ccgw` 的启动自检会通过、但实际连不上。用上面第 ② 条判断最准。
+第 ② 条能通说明隧道活着（`ccgw` 启动前的自检就是它）；第 ③ 条还额外验证了 CA 对不对。
 
 ### 开机自动重连（可选）
 
 macOS 用 launchd、Linux 用 systemd user unit 或 cron `@reboot` 都行。最省事的办法是往 rc 里塞一行
-惰性检查——只在 socket 不存在时才重建：
+惰性检查——只在代理口连不上时才重建：
 
 ```bash
 # ~/.zshrc（可选）
-[ -S "$HOME/.ccgw-laptop-1.sock" ] || \
+curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || \
   GATEWAY_HOST=gateway.example.com ~/path/to/setup-device.sh laptop-1 >/dev/null 2>&1
 ```
 
@@ -321,21 +340,41 @@ macOS 用 launchd、Linux 用 systemd user unit 或 cron `@reboot` 都行。最�
 | `GATEWAY_SSH_PORT` | `2222` | 网关 SSH 端口 |
 | `GATEWAY_HOST_KEY_FP` | 空 | 管理员给的指纹；不给则 TOFU 并要求你人工核对 |
 | `CMD_NAME` | `ccgw` | 生成的包装命令名；不能叫 `claude` |
-| `MIN_CLAUDE_VERSION` | `2.1.197` | 版本下限，低于只告警不中止 |
-| `CCGW_HOME` | `~/.ccgw` | 密钥、CA、包装命令的存放目录 |
-| `PLACEHOLDER_TOKEN` | `sk-ant-oat01-placeholder` | 占位凭证，所有设备可以填同一个假值 |
-| `LOCAL_HTTP_PORT` | `8788` | 本机明文入口（取 CA / 调试用） |
-| `PERMIT_TCP` / `PERMIT_SOCKET` | `127.0.0.1:8788` / `/run/ccgw.sock` | 须与网关 `permit_targets` 一致 |
+| `MIN_CLAUDE_VERSION` | `2.1.197` | 版本下限，低于**直接中止** |
+| `ALLOW_OLD_CLAUDE` | 空 | 设成 `1` 强行放行低版本（自担后果） |
+| `CCGW_HOME` | `~/.ccgw` | 密钥、CA、占位凭证、包装命令的存放目录 |
+| `PLACEHOLDER_TOKEN` | `sk-ant-oat01-placeholder` | 占位凭证里的假 token，所有设备可以一样 |
+| `SUBSCRIPTION_TYPE` | `max` | 占位凭证声明的档位；只影响 `/usage` 显示哪几条限额 |
+| `LOCAL_PROXY_PORT` | `8788` | 本机代理入口端口，`HTTPS_PROXY` 指向它 |
+| `PERMIT_TCP` | `127.0.0.1:8788` | 隧道右端目标，须与网关 `permit_targets` 一致 |
+| `REAL_CLAUDE_HOME` | `~/.claude` | 从哪儿把设置/记忆/历史链过来 |
 
 `ccgw` 内部**替你设好**的（你不用管，列出来只为让你知道发生了什么）：
 
 | 变量 | 值 | 作用 |
 |---|---|---|
-| `ANTHROPIC_UNIX_SOCKET` | `~/.ccgw-<id>.sock` | 把传输层换成 unix socket |
-| `NODE_EXTRA_CA_CERTS` | `~/.ccgw/ccgw_ca.crt` | 信任网关自建 CA |
-| `CLAUDE_CODE_OAUTH_TOKEN` | 占位值 | 让客户端走订阅分支、带 `oauth-2025` 头 |
-| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | `1` | 关掉遥测/GrowthBook 直连（它们走你的真实 IP） |
-| `ANTHROPIC_API_KEY` 等 4 个 | **unset** | 任何残留都会让 claude 绕开网关 |
+| `HTTPS_PROXY` / `HTTP_PROXY`（含小写） | `http://127.0.0.1:8788` | 把 claude 的全部 HTTP(S) 流量赶进隧道 |
+| `NODE_EXTRA_CA_CERTS` | `~/.ccgw/ccgw_ca.crt` | 信任网关自建 CA（它要终结 `api.anthropic.com` 的 TLS） |
+| `CLAUDE_CONFIG_DIR` | `~/.ccgw/claude-home` | 独立配置目录，占位凭证放这儿，不碰你真的 `~/.claude` |
+| `ANTHROPIC_API_KEY` 等 4 个 | **unset** | 任何残留都会让 claude 绕开网关或改发 `x-api-key` |
+| `ANTHROPIC_UNIX_SOCKET`、`CLAUDE_CODE_OAUTH_TOKEN` | **unset** | 见下 |
+
+**为什么要 unset `CLAUDE_CODE_OAUTH_TOKEN`**：设了它，客户端就走环境变量凭证分支，scopes 默认
+只有 `user:inference`，凭证文件根本不读。而 `/usage` 要求 scopes 含 `user:profile`，拿不到就
+直接返回空、**连请求都不发**——面板上就是那句 "only available for subscription plans"。
+所以占位凭证写成文件 `~/.ccgw/claude-home/.credentials.json`，自己把 scopes 定全：
+
+```json
+{"claudeAiOauth":{"accessToken":"sk-ant-oat01-placeholder","expiresAt":4102444800000,
+  "scopes":["user:inference","user:profile"],"subscriptionType":"max"}}
+```
+
+不给 `refreshToken`、`expiresAt` 又设到 2100 年，是为了让客户端别去刷新——拿占位 token 刷新
+必然失败，还会重试、拖慢启动。
+
+> **设备上的全部 HTTPS 流量都会经过网关**：遥测、WebFetch 抓的网页、MCP server 全走这条代理，
+> 没有从你本机 IP 直连出去的旁路。能出到哪些站点由网关的 `proxy.tunnel_hosts` 决定，
+> 只有 `api.anthropic.com` 会被网关解密并换上真凭证，其余都是不解密的 TCP 盲转发。
 
 ---
 
@@ -372,9 +411,23 @@ rm ~/.ccgw/known_hosts
 
 隧道建起来了但 `GET /ca` 没成功。多半是网关版本旧、没有 `/ca` 这个端点。找管理员升级。
 
-### `✗ 隧道未就绪(...sock 不存在)`（跑 `ccgw` 时）
+### `✗ 经代理访问 /status 失败(网关版本太旧?需要支持 CONNECT)`
+
+隧道和 CA 都拿到了，但代理这条路不通。基本是网关版本旧、还不会处理 `CONNECT`。找管理员升级。
+
+### `✗ Claude Code 版本过低`
+
+必须升级，见 [§0](#claude-code先查现状再决定要不要动)。真要用旧版：
+`ALLOW_OLD_CLAUDE=1 ./scripts/setup-device.sh laptop-1`。
+
+### `✗ 隧道未就绪(http://127.0.0.1:8788 连不上)`（跑 `ccgw` 时）
 
 隧道断了，重跑 `setup-device.sh`。
+
+### 端口 8788 被本机别的程序占了
+
+换一个：`LOCAL_PROXY_PORT=18788 ./scripts/setup-device.sh laptop-1`。改的只是本机这一端，
+隧道右端（`PERMIT_TCP`）不用动，包装命令会跟着一起重建。
 
 ### `⚠ PATH 里已存在同名命令 ccgw -> /usr/bin/ccgw`
 
@@ -398,6 +451,25 @@ GATEWAY_HOST=... GATEWAY_HOST_KEY_FP='SHA256:...' ./scripts/setup-device.sh lapt
 环境里有残留的 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`——它会让客户端改发 `x-api-key`，
 和网关注入的 Bearer 头冲突。`ccgw` 内部会 unset 这几个，但如果你是**手动**设环境变量跑 `claude`，
 就得自己清干净。用 `ccgw` 就不会有这个问题。
+
+### `/usage` 显示 "only available for subscription plans"
+
+客户端手里的 scopes 不含 `user:profile`，于是它压根不发那个请求。按顺序查：
+
+```bash
+echo "$CLAUDE_CODE_OAUTH_TOKEN"                    # 必须是空的
+echo "$CLAUDE_CONFIG_DIR"                          # 应为 ~/.ccgw/claude-home
+cat ~/.ccgw/claude-home/.credentials.json          # scopes 应含 user:profile
+```
+
+`CLAUDE_CODE_OAUTH_TOKEN` 非空是最常见的原因（比如写进了 `~/.zshrc`）——它一设，客户端就走
+环境变量分支，scopes 退回 inference-only，凭证文件不再被读。`ccgw` 会 unset 它，
+但你若是手动跑 `claude` 就得自己清掉。凭证文件不对就重跑 `setup-device.sh` 重写一份。
+
+### 想确认额度是不是真的走了网关
+
+`curl -s http://127.0.0.1:8788/status` 看网关侧采样到的 5h/7d 快照，和 `ccgw` 里 `/usage`
+显示的对一下。网关那边还会给每个请求打一行 `[usage] user=<你的设备 id> ...`，找管理员一看便知。
 
 ---
 
@@ -448,18 +520,24 @@ CA 可信 ← 因为隧道可信 ← 因为对面确实是网关 ← ？？？
 ├── ccgw_laptop-1.pub      # 公钥 —— 就是交给管理员的那行
 ├── ccgw_ca.crt            # 网关 CA 证书 —— NODE_EXTRA_CA_CERTS 指它
 ├── known_hosts            # pin 住的网关 host key
-└── bin/
-    └── ccgw               # 包装命令
-~/.ccgw-laptop-1.sock      # 隧道 unix socket（放 $HOME 是因为 socket 路径有长度上限）
+├── bin/
+│   └── ccgw               # 包装命令
+└── claude-home/           # ccgw 专用的 CLAUDE_CONFIG_DIR
+    ├── .credentials.json  # 占位凭证（600）—— 假 token + user:profile scope
+    ├── .claude.json       # ccgw 自己的 onboarding / 目录信任记录（跑过才有）
+    ├── settings.json      → ~/.claude/settings.json      （符号链接）
+    ├── CLAUDE.md          → ~/.claude/CLAUDE.md          （符号链接）
+    └── commands / agents / skills / plugins / projects / todos / statsig  （符号链接）
 ```
 
-目录权限 700，只有你自己能进。
+目录权限 700，只有你自己能进。链接过去的那些**不是拷贝**：真 `~/.claude` 里改了，`ccgw` 立刻
+跟着变；反过来在 `ccgw` 里改也是写进真目录。只有凭证是隔离的。
 
 **不再用了想彻底清掉**：
 
 ```bash
 pkill -f "ccgw_laptop-1"          # 断隧道
-rm -rf ~/.ccgw ~/.ccgw-laptop-1.sock
+rm -rf ~/.ccgw                    # 只删链接本身，不会动到真 ~/.claude 里的内容
 # 再把 ~/.zshrc 里那行 export PATH=... 删掉
 ```
 

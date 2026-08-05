@@ -217,6 +217,71 @@ func TestProxyStripsClientCredentials(t *testing.T) {
 	}
 }
 
+// 明文 http:// 经代理时按同样两个名单分流。命中 tunnel_hosts 的原样转过去,
+// 且【不注入】真凭证 —— 凭证只能进 mitm_hosts。
+func TestPlainHTTPTunnelHostNotInjected(t *testing.T) {
+	var gotAuth, gotHost string
+	third := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotHost = r.Header.Get("authorization"), r.Host
+		io.WriteString(w, "third-party")
+	}))
+	defer third.Close()
+	thirdHost := hostnameOf(third.Listener.Addr().String())
+
+	signer, pub := genClientKey(t)
+	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
+	addr := listen(t, s)
+	setGatewayGlobals(t, "http://127.0.0.1:1", []string{forgedHost}, []string{thirdHost})
+	serveGatewayHTTP(t, s)
+
+	sshc, err := dialSSH(addr, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sshc.Close()
+
+	res, err := proxyClient(t, sshc, readFile(t, s.ca.certPath)).Get(third.URL + "/some/path")
+	if err != nil {
+		t.Fatalf("明文 http 到 tunnel_hosts 应可达: %v", err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+
+	if string(body) != "third-party" {
+		t.Fatalf("应原样转给第三方,实际 %q", body)
+	}
+	if gotAuth != "" {
+		t.Fatalf("盲转发不该注入真凭证,第三方却收到了 %q", gotAuth)
+	}
+	if gotHost == upstreamURL.Host {
+		t.Fatalf("Host 不该被改写成上游,实际 %q", gotHost)
+	}
+}
+
+// 明文 http:// 打到两个名单都不命中的主机 → 403。
+func TestPlainHTTPUnlistedHostRejected(t *testing.T) {
+	signer, pub := genClientKey(t)
+	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
+	addr := listen(t, s)
+	setGatewayGlobals(t, "http://127.0.0.1:1", []string{forgedHost}, []string{"*.anthropic.com"})
+	serveGatewayHTTP(t, s)
+
+	sshc, err := dialSSH(addr, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sshc.Close()
+
+	res, err := proxyClient(t, sshc, readFile(t, s.ca.certPath)).Get("http://evil.example.com/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 403 {
+		t.Fatalf("名单外主机的明文请求应 403,实际 %d", res.StatusCode)
+	}
+}
+
 // 不在任何名单里的主机 → CONNECT 拒绝(不能拿真凭证去打无关目标)。
 func TestConnectRejectsUnlistedHost(t *testing.T) {
 	signer, pub := genClientKey(t)

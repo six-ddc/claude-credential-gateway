@@ -38,7 +38,7 @@ CMD_NAME=${CMD_NAME:-ccgw}
 # (日期分隔符 - / ,撇号在 U+0027/2019/02BC/02B9 之间切换)。官方 v2.1.197 已移除。
 # 老的 socket 形态不设代理,不在触发面上;换成 HTTPS_PROXY 之后【每次调用都在】,
 # 所以这里改成直接中止。确实要用旧版就显式设 ALLOW_OLD_CLAUDE=1 自担后果。
-# 详见 docs/anthropic-unix-socket.md。
+# 详见 docs/transport.md。
 MIN_CLAUDE_VERSION=${MIN_CLAUDE_VERSION:-2.1.197}
 ALLOW_OLD_CLAUDE=${ALLOW_OLD_CLAUDE:-}
 
@@ -189,12 +189,10 @@ else
   echo "⚠ 没找到 claude 命令,跳过版本检查。装好后请确认版本 >= $MIN_CLAUDE_VERSION。"
 fi
 
-# ⑦ 占位凭证。这是 socket 形态换成代理形态后最关键的一步。
-#
-#    以前用 CLAUDE_CODE_OAUTH_TOKEN 当占位,但客户端走 env token 分支时会把 scopes
-#    硬编码成 ['user:inference'],凭证文件根本不读。而 /usage 要求 scopes 里有
-#    'user:profile',拿不到就直接返回空、连请求都不发 —— 这正是 /usage 一直显示
-#    "only available for subscription plans" 的原因。改成写凭证文件才能自己定 scopes。
+# ⑦ 占位凭证。必须写成文件,不能用 CLAUDE_CODE_OAUTH_TOKEN 环境变量:
+#    客户端走 env token 分支时会把 scopes 硬编码成 ['user:inference'],凭证文件根本
+#    不读。而 /usage 要求 scopes 里有 'user:profile',拿不到就直接返回空、连请求都不发
+#    (界面上表现为 "only available for subscription plans")。写文件才能自己定 scopes。
 #
 #    放独立的 CLAUDE_CONFIG_DIR 里,不动你真的 ~/.claude/.credentials.json。
 mkdir -p "$CLAUDE_HOME"
@@ -227,6 +225,13 @@ CRED
 chmod 600 "$CLAUDE_HOME/.credentials.json"
 echo "== 占位凭证: $CLAUDE_HOME/.credentials.json (scopes 含 user:profile,/usage 才肯发请求)"
 
+# 换了 CLAUDE_CONFIG_DIR,onboarding 状态也跟着换了个地方记 —— 不给个初值的话,
+# 哪怕你真 ~ 早就走过引导,第一次跑 ccgw 还会被引导拦一道。只在文件不存在时种。
+if [ ! -f "$CLAUDE_HOME/.claude.json" ]; then
+  printf '{"hasCompletedOnboarding":true,"theme":"dark"}\n' > "$CLAUDE_HOME/.claude.json"
+  chmod 600 "$CLAUDE_HOME/.claude.json"
+fi
+
 # ⑧ 生成包装命令 —— 把那一堆 unset/export 收进一个可执行文件,
 #    不碰 shell 配置、不影响真的 claude(它仍然直连官方)。
 cat > "$WRAPPER" <<WRAP
@@ -244,20 +249,22 @@ curl -sf -m 5 "\$PROXY/status" >/dev/null 2>&1 || {
 [ -s "\$CA" ] || { echo "✗ CA 缺失(\$CA)。重跑 setup-device.sh。" >&2; exit 1; }
 
 # 这几个必须清掉,任何一个残留都会让 claude 绕开网关或改用 x-api-key 形状。
-# CLAUDE_CODE_OAUTH_TOKEN 尤其要清:设了它客户端就走 env 分支,scopes 被硬编码成
-# 只有 user:inference,凭证文件不读,/usage 直接拿不到数据。
+# 后两个尤其要清:设了它们客户端就走 env/fd 分支,scopes 被硬编码成只有
+# user:inference、凭证文件根本不读,/usage 直接拿不到数据。
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
-unset ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN
+unset ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR
 
 # 代理同时覆盖两条 HTTP 栈:全局 axios(/usage、profile、bootstrap 等)和
-# undici/fetch(SDK 的 /v1/messages)。socket 形态只覆盖后者,这正是要换的原因。
+# undici/fetch(SDK 的 /v1/messages)。两条都要覆盖,/usage 才拿得到额度。
 export HTTPS_PROXY="\$PROXY" HTTP_PROXY="\$PROXY"
 export https_proxy="\$PROXY" http_proxy="\$PROXY"
+# 本机地址必须排除,否则本地跑的 MCP server / dev server 也会被绕去网关。
+export NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
 export NODE_EXTRA_CA_CERTS="\$CA"
 export CLAUDE_CONFIG_DIR="\$CLAUDE_HOME"
 
-# 注意:这里【不】关旁路遥测。以前关是因为它走 axios 直连、会从设备真实 IP 发出;
-# 现在代理把 axios 也收编了,遥测和 API 调用一样从网关出口走,没有旁路可言了。
+# 这里【不】设 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:代理已经把 axios 收编,
+# 遥测和 API 调用一样从网关出口走,没有绕过网关的旁路可掐。
 exec claude "\$@"
 WRAP
 chmod 755 "$WRAPPER"
