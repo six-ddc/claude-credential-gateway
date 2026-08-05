@@ -117,24 +117,27 @@ func (s *sshServer) handleConnect(c net.Conn, br *bufio.Reader, req *http.Reques
 	relay(client, withPort(target, "443"))
 }
 
-// relay 拨通目标后纯字节对拷,两个方向任一结束就收摊。
+// relay 拨通目标后纯字节对拷。
+//
+// 任一方向结束就把两边都关掉,不去等另一个方向:上游先关而客户端还挂着时,
+// 那个方向正阻塞在 client.Read 上,不会自己返回 —— 等它就是永久泄漏一条
+// goroutine 和一条 SSH channel。关掉连接会让它的读写立刻出错退出。
 func relay(client net.Conn, target string) {
-	defer client.Close()
 	up, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		return // 200 已经发出去了,只能靠断开告诉客户端
+		client.Close() // 200 已经发出去了,只能靠断开告诉客户端
+		return
 	}
-	defer up.Close()
 
-	done := make(chan struct{}, 1)
-	go func() {
-		io.Copy(up, client)
-		// 半关闭让对端看到 EOF,而不是干等到超时
-		if c, ok := up.(*net.TCPConn); ok {
-			c.CloseWrite()
-		}
+	done := make(chan struct{}, 2)
+	copyOne := func(dst, src net.Conn) {
+		io.Copy(dst, src)
 		done <- struct{}{}
-	}()
-	io.Copy(client, up)
+	}
+	go copyOne(up, client)
+	go copyOne(client, up)
+
 	<-done
+	client.Close()
+	up.Close()
 }
