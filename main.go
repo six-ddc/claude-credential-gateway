@@ -107,8 +107,9 @@ func main() {
 	log.Printf("SSH host key 指纹: %s(设备首连时比对)", sshSrv.fingerprint)
 	log.Printf("TLS 终结 CA: %s(设备经隧道 GET /ca 自取)", sshSrv.ca.certPath)
 	caCertPEM = sshSrv.ca.certPEM
-	log.Printf("代理: 解密注入 %s;盲转发 %s",
-		strings.Join(cfg.Proxy.MITMHosts, ", "), strings.Join(cfg.Proxy.TunnelHosts, ", "))
+	// 名单写死在代码里,启动时打出来,免得要翻源码才知道放行了谁。
+	log.Printf("代理: 解密注入 %s", forgedHost)
+	log.Printf("代理: 盲转发 %s", strings.Join(tunnelHosts, ", "))
 	log.Printf("注入: 订阅 OAuth token (len=%d)", len(cfg.Upstream.OAuth))
 	ids := make([]string, 0, len(cfg.SSH.AuthorizedKeys))
 	for _, ak := range cfg.SSH.AuthorizedKeys {
@@ -155,12 +156,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 	// 明文 HTTP 经代理时是绝对形式请求(GET http://host/path);https 走 CONNECT,
 	// 在连接层就分流了,到不了这里。按主机名决定怎么处理:
-	//   命中 mitm_hosts → 跟解密出来的请求一样,换上游 + 注入真凭证
-	//   命中 tunnel_hosts → 原样转给它,不注入(WebFetch 抓 http 站点走这条)
-	//   都不命中 → 403
+	//   是注入主机(api.anthropic.com)→ 跟解密出来的请求一样,换上游 + 注入真凭证
+	//   在 tunnelHosts 里 → 原样转给它,不注入(WebFetch 抓 http 站点走这条)
+	//   两种都不是 → 403
 	inject := true
-	if r.URL.IsAbs() && !hostInList(cfg.Proxy.MITMHosts, hostnameOf(r.URL.Host)) {
-		if !hostInList(cfg.Proxy.TunnelHosts, hostnameOf(r.URL.Host)) {
+	if r.URL.IsAbs() && !isMITMHost(hostnameOf(r.URL.Host)) {
+		if !hostInList(tunnelHosts, hostnameOf(r.URL.Host)) {
 			writeError(w, 403, "host not permitted: "+r.URL.Host)
 			audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "proxy_host",
 				"user": device, "host": r.URL.Host})

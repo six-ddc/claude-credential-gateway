@@ -82,11 +82,6 @@ cp config.example.yaml config.yaml        # config.yaml 已在 .gitignore,改它
 upstream:
   base: https://api.anthropic.com
   oauth: ""               # 你订阅的真 access token;留空则用 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入
-proxy:                    # 正向代理:设备侧 HTTPS_PROXY 指向隧道口
-  mitm_hosts:                         # 解密并注入真凭证的主机 —— 只该放 Anthropic API 本身
-    - api.anthropic.com
-  tunnel_hosts:                       # 只做 TCP 盲转发、不解密也不注入的主机
-    - "*"
 ssh:                      # 唯一对外入口;设备台账的单一数据源
   addr: ":2222"                       # 唯一对外端口
   host_key: ./ssh_host_ed25519_key    # 服务端私钥;不存在则首启自动生成
@@ -99,24 +94,62 @@ ssh:                      # 唯一对外入口;设备台账的单一数据源
       key: "ssh-ed25519 AAAA... laptop-1"
 ```
 
-`mitm_hosts` / `tunnel_hosts` 都支持三种写法:`*`(任意主机)、`*.example.com`(子域,不含
-`example.com` 自身)、精确主机名。两个名单都不命中的 `CONNECT` 直接 403。
-
-- **`mitm_hosts` 决定真凭证会被送到哪儿**,多放一个域名就等于把订阅 token 交给那个域名,
-  所以默认也只有 `api.anthropic.com`(客户端无论怎么配,URL 里的主机名始终是它)。
-- **`tunnel_hosts` 决定其余流量能出到哪儿**。设备设了 `HTTPS_PROXY` 之后,客户端的全部 HTTPS
-  流量(遥测、WebFetch 抓的任意站点、MCP server)都会经过网关。默认 `"*"` 全放行:设备已经过
-  SSH 公钥认证,而收紧它会直接弄坏 WebFetch 这类功能。要收紧就把 `"*"` 换成具体域名列表。
-
 配置路径优先级:`GATEWAY_CONFIG` 指定 > 本地 `config.yaml` > `config.example.yaml`(模板,并提示拷贝)。
 
 可用环境变量覆盖:`GATEWAY_UPSTREAM_BASE`、`CLAUDE_GATEWAY_UPSTREAM_OAUTH`、
-`GATEWAY_PROXY_MITM_HOSTS`、`GATEWAY_PROXY_TUNNEL_HOSTS`(均逗号分隔)、
 `GATEWAY_SSH_ADDR`、`GATEWAY_SSH_HOST_KEY`、`GATEWAY_SSH_CA_KEY`、
 `GATEWAY_SSH_PERMIT_TARGETS`(逗号分隔)、`GATEWAY_SSH_AUTHORIZED_KEYS`(JSON `[{id,key}]`)。
 
 > `host_key` 与 `ca_key` 都是**私钥**,已 gitignore、权限 0600。生产上建议把它们放到仓库之外
 > (如 `/etc/ccgw/`),免得被 `git clean` 之类的操作误删。
+
+### 代理放行哪些主机
+
+配置里没有主机名单。哪个主机会被解密并注入真凭证、哪些只做盲转发,都写死在
+[`proxy.go`](./proxy.go) 里,**要放行别的主机就改代码重新编译** —— 让它进代码评审,而不是躺在
+某台机器的 YAML 里。「真凭证送给谁」和「设备能出到哪儿」都不该是部署时能随手改的东西。
+
+两份名单不是「白名单 vs 黑名单」,而是**两种不同的放行方式** —— 判断是「或」:
+
+| 主机 | 判在哪 | 网关怎么处理 |
+|---|---|---|
+| `api.anthropic.com` | `isMITMHost` | 解密 → 把占位 token 换成真凭证 → 转发 |
+| `tunnelHosts` 里的那些 | `hostInList` | 纯字节对拷,**不解密、不碰凭证** |
+| 其它 | 都不命中 | 403 |
+
+- **解密注入只认 `api.anthropic.com`**(大小写不敏感)。客户端无论上游配到哪儿,URL 里的主机名
+  始终是它,所以一个就够。它也**只能**走这条路:盲转发不解密,就没法替换 `Authorization`,而设备
+  手上只有占位 token —— 那样每个请求都会 401,网关就白做了。所以它不在 `tunnelHosts` 里不是被
+  漏掉,是压根不该在那儿。
+
+  官方表里挂在这个域下的「WebFetch 域名安全检查、特性开关拉取、遥测事件上报」因此走的都是注入
+  路径 —— 也就是说遥测是通的,并没有被关掉。
+- **`tunnelHosts` 管的是其余流量能出到哪儿**。设备设了 `HTTPS_PROXY` 之后,客户端的全部 HTTPS
+  流量都从网关出去,这份名单就是那部分的闸门。内容对齐官方《Enterprise network configuration》
+  列出的「Claude Code 需要访问的 URL」,共 12 个:`claude.ai`、`claude.com`、`code.claude.com`、
+  `platform.claude.com`、`downloads.claude.ai`、`raw.githubusercontent.com`、
+  `registry.npmjs.org`、`formulae.brew.sh`、`mcp-proxy.anthropic.com`、
+  `bridge.claudeusercontent.com`,以及两个遥测主机 `http-intake.logs.us5.datadoghq.com`、
+  `browser-intake-us5-datadoghq.com`。
+
+盲转发名单里的每一项支持三种写法:`*`(任意主机)、`*.example.com`(子域,不含 `example.com`
+自身)、精确主机名。
+
+**这份名单只覆盖工具自身需要的主机。**`WebFetch` 抓名单外的站点、连第三方 remote MCP server
+都会被 403,这是有意的取舍,不要指望 WebFetch 能随便抓。被拒的 `CONNECT` 回的是一个说得清缘由的
+403,body 里有被拒的主机名和该往哪儿加的提示 —— 客户端那头只看得到代理的状态码,这个 body 是
+排查依据。
+
+`storage.googleapis.com` 是唯一刻意留在名单外的官方主机:它是多租户通用存储主机,放行等于开一条
+很宽的出口;而官方文档写明这个用途在它被挡时会回落到 `api.anthropic.com`,代价只是 `/plugin` 里
+看不到安装数与插件元数据。
+
+网关启动时会把两份名单打出来,不用翻源码就知道放行了谁:
+
+```
+代理: 解密注入 api.anthropic.com
+代理: 盲转发 claude.ai, claude.com, code.claude.com, ...
+```
 
 ## 快速开始
 
@@ -228,7 +261,7 @@ exec claude "$@"
 > 可覆盖这个下限,`ALLOW_OLD_CLAUDE=1` 可强行放行(自担后果)。
 >
 > **设备的全部 HTTPS 流量都从网关出去**。遥测、WebFetch、MCP 也都走这条代理,没有绕开网关、
-> 从设备真实 IP 发出的旁路,所以不需要再去关非必要流量;放行范围由 `proxy.tunnel_hosts` 决定。
+> 从设备真实 IP 发出的旁路,所以不需要再去关非必要流量;放行范围由 `proxy.go` 里的盲转发名单决定。
 
 ## 隧道口上跑的是什么
 
@@ -241,14 +274,14 @@ exec claude "$@"
 | `0x16` | 直接 TLS 握手 | TLS 记录的第一个字节 |
 | 其它 | 普通 HTTP | `GET /ca` 取 CA、`GET /status` 看限额 |
 
-`CONNECT` 到 `mitm_hosts` 里的主机时,网关回 `200 Connection Established` 之后**就地终结 TLS**:
+`CONNECT api.anthropic.com` 时,网关回 `200 Connection Established` 之后**就地终结 TLS**:
 它用自建 CA 现签一张 `api.anthropic.com` 证书,设备用 `NODE_EXTRA_CA_CERTS` 信任这把 CA 即可;
-解密出来的请求走正常的注入 + 转发流程。`CONNECT` 到 `tunnel_hosts` 的主机则是纯 TCP 对拷,
-网关不解密也不注入。两个名单都不命中的,直接 403。
+解密出来的请求走正常的注入 + 转发流程。`CONNECT` 到盲转发名单里的主机则是纯 TCP 对拷,
+网关不解密也不注入。两处都不命中的,直接 403。
 
-明文 `http://` 走代理时是绝对形式请求(`GET http://host/path`),按同样两个名单分流:
-命中 `mitm_hosts` 的换上游并注入真凭证,命中 `tunnel_hosts` 的原样转过去、**不注入**
-(WebFetch 抓 http 站点走这条),都不命中才 403。真凭证只会进 `mitm_hosts` 里的主机。
+明文 `http://` 走代理时是绝对形式请求(`GET http://host/path`),按同样的名单分流:
+`api.anthropic.com` 换上游并注入真凭证,盲转发名单里的原样转过去、**不注入**
+(WebFetch 抓 http 站点走这条),都不命中才 403。真凭证只会进 `api.anthropic.com`。
 
 限额快照两种拿法都行:
 
@@ -362,8 +395,9 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
   `setup-device.sh`(会更新 `known_hosts`)。
 - **CA 轮换**:删掉 `ccgw_ca_key`(含 `.crt`)重启自动生成 → 设备重跑脚本重新取 CA。
   旧 CA 还留在设备上的话,`ccgw` 会报证书错误。
-- **收紧出口**:改 `proxy.tunnel_hosts`(或 `GATEWAY_PROXY_TUNNEL_HOSTS`)。注意收得太紧会
-  弄坏 WebFetch 和 MCP —— 它们的流量也从这条代理出去。
+- **调整出口范围**:改 `proxy.go` 里的 `tunnelHosts` 重新编译、重启。名单默认只放行工具自身
+  要用的主机,所以放宽的场合更常见 —— WebFetch 抓名单外的站点、第三方 remote MCP server 都要
+  在这里加,它们的流量也从这条代理出去。
 
 ## 安全与合规边界
 
@@ -378,10 +412,11 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
 - **CA 私钥比 host key 更敏感**:拿到 `ccgw_ca_key` 就能对任何信任该 CA 的设备伪造
   `api.anthropic.com`。它只该待在网关机上;分发给设备的 `.crt` 不是密钥。
 - **网关同时是设备的出口代理**。设备设了 `HTTPS_PROXY` 之后,claude 的全部 HTTPS 流量都从网关
-  出去,别人看到的是网关机的 IP,网关机也承担这部分流量。`tunnel_hosts` 是唯一的闸门,默认
-  `"*"` 等于对已认证设备全放行 —— 在意的话就换成白名单。
-- **`mitm_hosts` 就是「真凭证送给谁」的名单**。往里加域名等于把订阅 token 交给那个域名,
-  除了 `api.anthropic.com` 不该有别的。盲转发那条路不解密、也不会碰到凭证。
+  出去,别人看到的是网关机的 IP,网关机也承担这部分流量。`proxy.go` 里的 `tunnelHosts` 是唯一
+  的闸门,只放行工具自身要用的主机;放宽它等于把网关往通用出口代理的方向推,所以这件事得改代码、
+  过评审。
+- **真凭证只会送给 `api.anthropic.com`**,这条写死在代码里(`isMITMHost`),不是配置项 ——
+  换成别的域名就等于把订阅 token 交给那个域名。盲转发那条路不解密、也不会碰到凭证。
 - **真凭证只走环境变量。** 别把 token 写进提交的文件;含明文 token 的本地启动脚本(如 `gateway.sh`)
   与本地 `config.yaml` 都已在 `.gitignore` 中。
 - **token 续期**:网关里只贴 access token 会几小时过期;稳妥做法是网关机器正常登录、由网关从

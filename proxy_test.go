@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"crypto/x509"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,8 +48,86 @@ func TestHostnameOf(t *testing.T) {
 	}
 }
 
+// 写死的盲转发名单:放行 Claude Code 自身要用的主机,但不放行 storage.googleapis.com
+// 这类多租户通用主机,也不放行任意第三方站点(WebFetch 抓名单外的站要改代码)。
+func TestTunnelHostsAllowlist(t *testing.T) {
+	// 官方《Enterprise network configuration》列的主机都该放行
+	for _, h := range []string{
+		"claude.ai", "claude.com", "code.claude.com", "platform.claude.com",
+		"downloads.claude.ai", "raw.githubusercontent.com",
+		"registry.npmjs.org", "formulae.brew.sh",
+		"mcp-proxy.anthropic.com", "bridge.claudeusercontent.com",
+		"http-intake.logs.us5.datadoghq.com", "browser-intake-us5-datadoghq.com",
+	} {
+		if !hostInList(tunnelHosts, h) {
+			t.Errorf("%s 应在盲转发名单里", h)
+		}
+	}
+
+	// storage.googleapis.com 刻意留在外面:多租户通用存储主机,且官方说明它被挡时
+	// 会回落到 api.anthropic.com。任意第三方站同样不放行。
+	for _, h := range []string{
+		"storage.googleapis.com",
+		"evil.example.com", "github.com", "api-staging.anthropic.com",
+	} {
+		if hostInList(tunnelHosts, h) {
+			t.Errorf("%s 不该在盲转发名单里", h)
+		}
+	}
+
+	// 名单绝不能含 "*" —— 那等于把网关变成通用出口代理
+	for _, p := range tunnelHosts {
+		if p == "*" {
+			t.Fatal(`名单不该含 "*"`)
+		}
+	}
+
+	// api.anthropic.com 归注入路径,不该同时出现在盲转发名单里
+	if hostInList(tunnelHosts, forgedHost) {
+		t.Errorf("%s 该走注入路径,不该在盲转发名单里", forgedHost)
+	}
+}
+
+// 注入路径只认 api.anthropic.com 一个主机,且大小写不敏感。
+func TestIsMITMHost(t *testing.T) {
+	for _, h := range []string{forgedHost, "API.ANTHROPIC.COM"} {
+		if !isMITMHost(h) {
+			t.Errorf("%s 应走注入路径", h)
+		}
+	}
+	for _, h := range []string{
+		"claude.ai", "api.anthropic.com.evil.com", "evil.com", "",
+	} {
+		if isMITMHost(h) {
+			t.Errorf("%s 不该走注入路径(真凭证只能进 %s)", h, forgedHost)
+		}
+	}
+}
+
+// 被拒的 CONNECT 要回一个说得清缘由的 403:带主机名,还得告诉人该动哪个配置。
+func TestConnectDeniedResponseIsActionable(t *testing.T) {
+	cl, srv := net.Pipe()
+	go func() {
+		writeConnectDenied(srv, "blocked.example.com")
+	}()
+	res, err := http.ReadResponse(bufio.NewReader(cl), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 403 {
+		t.Fatalf("应为 403,实际 %d", res.StatusCode)
+	}
+	body, _ := io.ReadAll(res.Body)
+	for _, want := range []string{"blocked.example.com", "tunnelHosts", "proxy.go"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("403 响应体应含 %q,实际 %s", want, body)
+		}
+	}
+}
+
 // setGatewayGlobals 把 handle() 依赖的那几个包级变量指到测试实例上,并在收尾时还原。
-func setGatewayGlobals(t *testing.T, upstreamBase string, mitm, tunnel []string) {
+func setGatewayGlobals(t *testing.T, upstreamBase string) {
 	t.Helper()
 	prevCfg, prevURL, prevClient := cfg, upstreamURL, httpClient
 	t.Cleanup(func() { cfg, upstreamURL, httpClient = prevCfg, prevURL, prevClient })
@@ -55,8 +135,6 @@ func setGatewayGlobals(t *testing.T, upstreamBase string, mitm, tunnel []string)
 	c := &Config{}
 	c.Upstream.Base = upstreamBase
 	c.Upstream.OAuth = testRealToken
-	c.Proxy.MITMHosts = mitm
-	c.Proxy.TunnelHosts = tunnel
 	cfg = c
 
 	u, err := url.Parse(upstreamBase)
@@ -66,6 +144,14 @@ func setGatewayGlobals(t *testing.T, upstreamBase string, mitm, tunnel []string)
 	upstreamURL = u
 	httpClient = &http.Client{Transport: &http.Transport{DisableCompression: true}}
 
+}
+
+// withTunnelHosts 临时替换写死的盲转发名单(名单本身没有配置项,测试只能这么改)。
+func withTunnelHosts(t *testing.T, hosts ...string) {
+	t.Helper()
+	prev := tunnelHosts
+	t.Cleanup(func() { tunnelHosts = prev })
+	tunnelHosts = hosts
 }
 
 // serveGatewayHTTP 用真正的 handle() 消费隧道连接。
@@ -114,7 +200,7 @@ func TestProxyForwardsNonV1Path(t *testing.T) {
 	signer, pub := genClientKey(t)
 	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
 	addr := listen(t, s)
-	setGatewayGlobals(t, up.URL, []string{forgedHost}, []string{"*"})
+	setGatewayGlobals(t, up.URL)
 	serveGatewayHTTP(t, s)
 
 	sshc, err := dialSSH(addr, signer)
@@ -158,7 +244,7 @@ func TestProxyPreservesQuery(t *testing.T) {
 	signer, pub := genClientKey(t)
 	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
 	addr := listen(t, s)
-	setGatewayGlobals(t, up.URL, []string{forgedHost}, []string{"*"})
+	setGatewayGlobals(t, up.URL)
 	serveGatewayHTTP(t, s)
 
 	sshc, err := dialSSH(addr, signer)
@@ -191,7 +277,7 @@ func TestProxyStripsClientCredentials(t *testing.T) {
 	signer, pub := genClientKey(t)
 	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
 	addr := listen(t, s)
-	setGatewayGlobals(t, up.URL, []string{forgedHost}, []string{"*"})
+	setGatewayGlobals(t, up.URL)
 	serveGatewayHTTP(t, s)
 
 	sshc, err := dialSSH(addr, signer)
@@ -217,8 +303,8 @@ func TestProxyStripsClientCredentials(t *testing.T) {
 	}
 }
 
-// 明文 http:// 经代理时按同样两个名单分流。命中 tunnel_hosts 的原样转过去,
-// 且【不注入】真凭证 —— 凭证只能进 mitm_hosts。
+// 明文 http:// 经代理时按同样两种方式分流。命中 tunnelHosts 的原样转过去,
+// 且【不注入】真凭证 —— 凭证只能进注入主机 api.anthropic.com。
 func TestPlainHTTPTunnelHostNotInjected(t *testing.T) {
 	var gotAuth, gotHost string
 	third := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +317,8 @@ func TestPlainHTTPTunnelHostNotInjected(t *testing.T) {
 	signer, pub := genClientKey(t)
 	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
 	addr := listen(t, s)
-	setGatewayGlobals(t, "http://127.0.0.1:1", []string{forgedHost}, []string{thirdHost})
+	setGatewayGlobals(t, "http://127.0.0.1:1")
+	withTunnelHosts(t, thirdHost)
 	serveGatewayHTTP(t, s)
 
 	sshc, err := dialSSH(addr, signer)
@@ -242,7 +329,7 @@ func TestPlainHTTPTunnelHostNotInjected(t *testing.T) {
 
 	res, err := proxyClient(t, sshc, readFile(t, s.ca.certPath)).Get(third.URL + "/some/path")
 	if err != nil {
-		t.Fatalf("明文 http 到 tunnel_hosts 应可达: %v", err)
+		t.Fatalf("明文 http 到 tunnelHosts 应可达: %v", err)
 	}
 	body, _ := io.ReadAll(res.Body)
 	res.Body.Close()
@@ -263,7 +350,7 @@ func TestPlainHTTPUnlistedHostRejected(t *testing.T) {
 	signer, pub := genClientKey(t)
 	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
 	addr := listen(t, s)
-	setGatewayGlobals(t, "http://127.0.0.1:1", []string{forgedHost}, []string{"*.anthropic.com"})
+	setGatewayGlobals(t, "http://127.0.0.1:1")
 	serveGatewayHTTP(t, s)
 
 	sshc, err := dialSSH(addr, signer)
@@ -287,7 +374,7 @@ func TestConnectRejectsUnlistedHost(t *testing.T) {
 	signer, pub := genClientKey(t)
 	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
 	addr := listen(t, s)
-	setGatewayGlobals(t, "http://127.0.0.1:1", []string{forgedHost}, []string{"*.anthropic.com"})
+	setGatewayGlobals(t, "http://127.0.0.1:1")
 	serveGatewayHTTP(t, s)
 
 	sshc, err := dialSSH(addr, signer)
@@ -302,7 +389,7 @@ func TestConnectRejectsUnlistedHost(t *testing.T) {
 	}
 }
 
-// 盲转发:命中 tunnel_hosts 的主机纯 TCP 对拷,不解密、不注入凭证。
+// 盲转发:命中 tunnelHosts 的主机纯 TCP 对拷,不解密、不注入凭证。
 // (设了 HTTPS_PROXY 之后 WebFetch / MCP / 遥测都会走这条,断了会弄坏功能。)
 func TestConnectBlindTunnel(t *testing.T) {
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
@@ -315,7 +402,8 @@ func TestConnectBlindTunnel(t *testing.T) {
 	signer, pub := genClientKey(t)
 	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
 	addr := listen(t, s)
-	setGatewayGlobals(t, "http://127.0.0.1:1", []string{forgedHost}, []string{"127.0.0.1"})
+	setGatewayGlobals(t, "http://127.0.0.1:1")
+	withTunnelHosts(t, "127.0.0.1")
 	serveGatewayHTTP(t, s)
 
 	sshc, err := dialSSH(addr, signer)

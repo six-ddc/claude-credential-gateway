@@ -24,18 +24,6 @@ type SSHConfig struct {
 	AuthorizedKeys []AuthorizedKey `yaml:"authorized_keys"` // 可信设备公钥,每台一项
 }
 
-// ProxyConfig 是正向代理形态(CONNECT)的主机名单。两个名单都支持 "*"、"*.example.com"
-// 与精确主机名三种写法。
-type ProxyConfig struct {
-	// MITMHosts:解密并注入真凭证的主机。只该放 Anthropic API 本身。
-	MITMHosts []string `yaml:"mitm_hosts"`
-	// TunnelHosts:只做 TCP 盲转发、不解密也不注入凭证的主机。
-	// 设了 HTTPS_PROXY 之后客户端的【全部】 https 流量都会经过网关(遥测、WebFetch
-	// 抓的任意站点、MCP server),这个名单决定放行到哪儿。默认 "*" 全放行 ——
-	// 设备已经过 SSH 公钥认证,且收紧它会直接弄坏 WebFetch。
-	TunnelHosts []string `yaml:"tunnel_hosts"`
-}
-
 // Config 是网关的全部配置。真凭证建议用环境变量注入(env 覆盖 YAML)。
 // 网关不监听任何 HTTP 端口:转发 channel 在进程内直连 HTTP handler,故没有 host/port 配置。
 type Config struct {
@@ -43,8 +31,7 @@ type Config struct {
 		Base  string `yaml:"base"`
 		OAuth string `yaml:"oauth"` // 你订阅的真 access token
 	} `yaml:"upstream"`
-	SSH   SSHConfig   `yaml:"ssh"`
-	Proxy ProxyConfig `yaml:"proxy"`
+	SSH SSHConfig `yaml:"ssh"`
 }
 
 // loadConfig 解析配置文件并应用环境变量覆盖与默认值。
@@ -105,12 +92,6 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("GATEWAY_SSH_PERMIT_TARGETS"); v != "" {
 		c.SSH.PermitTargets = strings.Split(v, ",")
 	}
-	if v := os.Getenv("GATEWAY_PROXY_MITM_HOSTS"); v != "" {
-		c.Proxy.MITMHosts = strings.Split(v, ",")
-	}
-	if v := os.Getenv("GATEWAY_PROXY_TUNNEL_HOSTS"); v != "" {
-		c.Proxy.TunnelHosts = strings.Split(v, ",")
-	}
 	if v := os.Getenv("GATEWAY_SSH_AUTHORIZED_KEYS"); v != "" {
 		var list []AuthorizedKey
 		if err := json.Unmarshal([]byte(v), &list); err == nil {
@@ -137,12 +118,5 @@ func (c *Config) applyDefaults() {
 		// unix 目标留着兼容老设备的 ANTHROPIC_UNIX_SOCKET 形态。
 		// 网关并不真监听它们,这里只是校验客户端 -L 声明的目标,防止误以为能转发到别处。
 		c.SSH.PermitTargets = []string{"127.0.0.1:8788", "unix:/run/ccgw.sock"}
-	}
-	if len(c.Proxy.MITMHosts) == 0 {
-		// 客户端无论上游配到哪儿,URL 里的主机名始终是 api.anthropic.com。
-		c.Proxy.MITMHosts = []string{forgedHost}
-	}
-	if len(c.Proxy.TunnelHosts) == 0 {
-		c.Proxy.TunnelHosts = []string{"*"}
 	}
 }

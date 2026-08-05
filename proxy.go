@@ -21,9 +21,47 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// 两份主机名单都写死在代码里,不做成配置项:
+//
+//   - 「真凭证送给谁」不该是部署时能随手改的东西;
+//   - 「设备能出到哪儿」也一样,改宽了就等于把网关变成通用出口代理。
+//
+// 需要放行别的主机(WebFetch 抓的站点、自建 remote MCP server)就改这里、重新编译,
+// 让它进代码评审,而不是躺在某台机器的 YAML 里。
+//
+// tunnelHosts 是 var 而非 const 切片,仅因为测试要临时替换它。
+var tunnelHosts = []string{
+	// 账号、文档、下载
+	"claude.ai",                 // 账号认证
+	"claude.com",                // 预置文档查询(登录页会重定向到 claude.ai)
+	"code.claude.com",           // claude-code-guide 与预置 WebFetch 的文档查询
+	"platform.claude.com",       // OAuth token 的交换 / 刷新 / 吊销
+	"downloads.claude.ai",       // 插件下载、原生安装器与自动更新
+	"raw.githubusercontent.com", // /release-notes 的 changelog
+	// 包源(按安装方式二选一,留着不碍事)
+	"registry.npmjs.org", // npm / bun 安装方式
+	"formulae.brew.sh",   // Homebrew 安装方式的版本检查
+	// MCP 与浏览器扩展
+	"mcp-proxy.anthropic.com",      // claude.ai 侧 MCP connector(claude.ai 账号默认开启)
+	"bridge.claudeusercontent.com", // Claude in Chrome 的 WebSocket 桥
+	// 遥测与错误上报(没关 telemetry,这两个要通)
+	"http-intake.logs.us5.datadoghq.com",
+	"browser-intake-us5-datadoghq.com",
+}
+
+// 解密并注入真凭证的主机只有一个,就是 tlsterm.go 里的 forgedHost:客户端无论上游配到
+// 哪儿,URL 里的主机名始终是 api.anthropic.com,要解密就得冒充它。官方表里挂在这个域下的
+// 「WebFetch 域名安全检查、特性开关拉取、遥测事件上报」因此走的都是注入路径。
+//
+// storage.googleapis.com 刻意不在 tunnelHosts 里:多租户通用存储主机,放行等于开一条很宽的
+// 出口;而官方文档写明这个用途在它被挡时会回落到 api.anthropic.com,代价只是 /plugin 里
+// 看不到安装数与插件元数据。
+func isMITMHost(hostname string) bool { return strings.EqualFold(hostname, forgedHost) }
 
 // dialTimeout 是盲转发拨号上游的上限。
 const dialTimeout = 15 * time.Second
@@ -72,14 +110,16 @@ func withPort(hostport, defPort string) string {
 	return net.JoinHostPort(hostport, defPort)
 }
 
-// handleConnect 处理一条已经读出 CONNECT 请求的隧道连接。两条去向:
+// handleConnect 处理一条已经读出 CONNECT 请求的隧道连接。放行有两种方式,不是
+// 「白名单 vs 黑名单」而是「两种不同的处理办法」:
 //
-//   - 命中 mitm_hosts:回 200 后就地 TLS 终结,解密出来的请求塞回 HTTP Server,
-//     走正常的注入+转发流程;
-//   - 命中 tunnel_hosts:回 200 后纯 TCP 对拷,不解密、不注入(遥测、WebFetch 抓的
-//     任意站点、MCP 走这条 —— 设了 HTTPS_PROXY 之后它们也都会经过网关)。
+//   - 命中注入主机(api.anthropic.com):回 200 后就地 TLS 终结,解密出来的请求塞回
+//     HTTP Server,走注入+转发流程。它只能走这条 —— 盲转发不解密,就没法替换
+//     Authorization,而设备手上只有占位 token,那样每个请求都会 401;
+//   - 命中 tunnelHosts:回 200 后纯 TCP 对拷,不解密、也不碰凭证(账号认证、文档查询、
+//     包源、MCP connector、Datadog 遥测走这条)。
 //
-// 两个名单都不命中就 403。
+// 两种都不命中才 403。
 func (s *sshServer) handleConnect(c net.Conn, br *bufio.Reader, req *http.Request, device string) {
 	target := req.URL.Host
 	if target == "" {
@@ -87,10 +127,9 @@ func (s *sshServer) handleConnect(c net.Conn, br *bufio.Reader, req *http.Reques
 	}
 	hostname := hostnameOf(target)
 
-	mitm := hostInList(cfg.Proxy.MITMHosts, hostname)
-	if !mitm && !hostInList(cfg.Proxy.TunnelHosts, hostname) {
-		io.WriteString(c, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-		c.Close()
+	mitm := isMITMHost(hostname)
+	if !mitm && !hostInList(tunnelHosts, hostname) {
+		writeConnectDenied(c, hostname)
 		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "connect_host",
 			"user": device, "host": hostname})
 		return
@@ -115,6 +154,18 @@ func (s *sshServer) handleConnect(c net.Conn, br *bufio.Reader, req *http.Reques
 	audit(map[string]any{"ts": nowMs(), "ok": true, "event": "connect_tunnel",
 		"user": device, "host": target})
 	relay(client, withPort(target, "443"))
+}
+
+// writeConnectDenied 回一个说得清缘由的 403。名单收紧之后被拦是常态(WebFetch 抓
+// 名单外的站点就会撞上),客户端那头只看得到代理的状态码,所以这里把主机名和该动
+// 哪个配置项都写进去 —— 否则排查时只剩一个光秃秃的 403。
+func writeConnectDenied(c net.Conn, hostname string) {
+	body := `{"error":"host not permitted by gateway","host":"` + hostname +
+		`","hint":"add it to tunnelHosts in proxy.go and redeploy the gateway"}`
+	io.WriteString(c, "HTTP/1.1 403 Forbidden\r\n"+
+		"Content-Type: application/json\r\n"+
+		"Content-Length: "+strconv.Itoa(len(body))+"\r\n\r\n"+body)
+	c.Close()
 }
 
 // relay 拨通目标后纯字节对拷。

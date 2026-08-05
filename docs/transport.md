@@ -7,7 +7,7 @@
 >   下文写作「客户端源码」,行号相对还原出来的 `src/` 目录(如 `utils/proxy.ts:300-305`);
 > - **官方文档** ——《[Enterprise network configuration](https://code.claude.com/docs/en/network-config)》
 >   与《[LLM gateway](https://code.claude.com/docs/en/llm-gateway)》;
-> - **网关自身代码** —— `proxy.go`、`sshfwd.go`、`main.go`、`tlsterm.go`、`config.go`。
+> - **网关自身代码** —— `proxy.go`、`sshfwd.go`、`main.go`、`tlsterm.go`。
 
 ---
 
@@ -205,16 +205,39 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
 
 ### 5.2 CONNECT 之后按名单二选一
 
-`handleConnect`(`proxy.go:82-117`)拿 CONNECT 的目标主机名比两个配置名单:
+`handleConnect`(`proxy.go:121-155`)拿 CONNECT 的目标主机名比两份名单:
 
-- 命中 `proxy.mitm_hosts` → 回 200,就地 TLS 终结,解密出的请求塞回 HTTP Server,走正常的注入 + 转发;
-- 命中 `proxy.tunnel_hosts` → 回 200,纯 TCP 对拷,不解密也不注入(遥测、WebFetch 抓的任意站点、
-  MCP server 走这条);
-- 两个都不命中 → 403。
+- 命中注入主机(`isMITMHost`,`proxy.go:64`)→ 回 200,就地 TLS 终结,解密出的请求塞回 HTTP
+  Server,走正常的注入 + 转发;
+- 命中盲转发名单(`tunnelHosts`,`proxy.go:38-55`)→ 回 200,纯 TCP 对拷,不解密也不注入
+  (账号认证、文档查询、包源、MCP connector、Datadog 遥测走这条);
+- 两处都不命中 → 403。
 
-两个名单都支持 `*`、`*.example.com`、精确主机名三种写法(`proxy.go:38-47`)。默认值在
-`config.go:141-147`:`mitm_hosts` 只有 `api.anthropic.com` —— 多放一个域名就等于把真凭证送到那儿去;
-`tunnel_hosts` 是 `*` 全放行 —— 设备已经过 SSH 公钥认证,而收紧它会直接弄坏 WebFetch。
+**两份名单都写死在代码里,不是配置项。**「真凭证送给谁」和「设备能出到哪儿」都不该是部署时随手
+能改的东西,要放行别的主机就改 `proxy.go` 重新编译,让它进代码评审。`tunnelHosts` 声明成 `var`
+只是为了让测试能临时替换它。名单项支持 `*`、`*.example.com`、精确主机名三种写法
+(`hostMatches`,`proxy.go:77-86`)。
+
+- **注入路径只认一个主机**:`tlsterm.go` 里的 `forgedHost`,也就是 `api.anthropic.com`(比对大小写
+  不敏感)。客户端无论上游配到哪儿,URL 里的主机名始终是它,一个就够;多放一个域名就等于把真凭证
+  送到那儿去。官方表里挂在这个域下的「WebFetch 域名安全检查、特性开关拉取、遥测事件上报」因此
+  走的都是注入路径 —— 遥测是通的,并没有被关掉。也正因为归注入路径先判,`api.anthropic.com`
+  不在 `tunnelHosts` 里。
+- **盲转发名单**对齐官方《Enterprise network configuration》列出的「Claude Code 需要访问的
+  URL」,共 12 个:账号认证与文档查询(`claude.ai`、`claude.com`、`code.claude.com`)、
+  OAuth token 的交换 / 刷新 / 吊销(`platform.claude.com`)、插件下载与自动更新(`downloads.claude.ai`)、
+  changelog(`raw.githubusercontent.com`)、两个包源(`registry.npmjs.org`、`formulae.brew.sh`)、
+  MCP connector 代理(`mcp-proxy.anthropic.com`)、Chrome 桥(`bridge.claudeusercontent.com`)、
+  两个 Datadog 端点(`http-intake.logs.us5.datadoghq.com`、`browser-intake-us5-datadoghq.com`)。
+  它只覆盖**工具自身需要的主机**:WebFetch 抓名单外的站点、连第三方 remote MCP server 都会被
+  403,这是有意的取舍。
+- `storage.googleapis.com` 是唯一刻意留在名单外的官方主机 —— 多租户通用存储主机,放行等于开一条
+  很宽的出口;而官方写明它被挡时会回落到 `api.anthropic.com`,代价只是 `/plugin` 里看不到安装数
+  与插件元数据。
+
+网关启动时把两份名单各打一行(`main.go:111-112`),不用翻源码就知道放行了谁。被拦的 CONNECT 回的
+是带缘由的 403(`writeConnectDenied`,`proxy.go:160-167`):body 是 JSON,带被拒的主机名和该往
+盲转发名单里加的提示。客户端那头只看得到代理的状态码,不这么写排查时只剩一个光秃秃的 403。
 
 ### 5.3 注入与透传
 
@@ -222,14 +245,14 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
 
 - **身份来自连接本身**。SSH 层公钥认证出的 device id 由 `ConnContext` 写进每个请求的 context;
   客户端 `Authorization` 里的占位 token 不参与鉴权,随后被整个覆盖成真订阅 token。
-- **上游 path 原样透传**(`main.go:184`)。客户端要打哪个端点就转哪个 —— 这是 `/usage` 能工作的前提之一。
+- **上游 path 原样透传**(`main.go:183-185`)。客户端要打哪个端点就转哪个 —— 这是 `/usage` 能工作的前提之一。
   路径一旦被改写,客户端拿到的报错就跟它请求的端点毫无关系,极难排查。
 - **剥掉客户端的凭证企图**(`main.go:46-59`)。`x-api-key` 必剥:设备上残留的 `ANTHROPIC_API_KEY` 会让
   客户端改发这个头,它优先级高于 `Authorization`,不剥就是上游拿假 key 校验后 401。
   `proxy-authorization` 也剥 —— 那是客户端发给**代理**的,不该转给上游。
-- **明文 HTTP 按同样两个名单分流**。经代理的明文请求是绝对形式(`GET http://host/path`):
-  命中 `mitm_hosts` 的换上游并注入真凭证;命中 `tunnel_hosts` 的原样转过去且**不注入**
-  (WebFetch 抓 http 站点靠这条);都不命中才 403。真凭证只进 `mitm_hosts` 里的主机。
+- **明文 HTTP 按同样两份名单分流**(`main.go:163-172`)。经代理的明文请求是绝对形式
+  (`GET http://host/path`):`api.anthropic.com` 换上游并注入真凭证;命中盲转发名单的原样转过去且
+  **不注入**(WebFetch 抓 http 站点靠这条);都不命中才 403。真凭证只进 `api.anthropic.com`。
   不注入的那条同时也不采样限额、不记 token 用量 —— 第三方响应里的同名字段不是那个意思。
 
 ---
@@ -327,8 +350,8 @@ scopes 是字面量写死的(`utils/auth.ts:1266`),keychain 和凭证文件都�
 | env token 分支硬编码 scopes | 客户端 `utils/auth.ts:1255-1272`(`1266`)、`1402-1408` |
 | 凭证文件路径 / keychain service name | 客户端 `utils/envUtils.ts:7-14`、`utils/secureStorage/plainTextStorage.ts:13-17`、`macOsKeychainHelpers.ts:27-41`、`index.ts:9-17` |
 | 代理 / CA / mTLS 的官方支持说明 | 《Enterprise network configuration》 |
-| CONNECT 分流、盲转发 | `proxy.go`(`handleConnect` 在 `82`) |
+| CONNECT 分流、盲转发 | `proxy.go`(`handleConnect` 在 `121`) |
 | 首字节分派、deadline no-op 与 Hijack 陷阱 | `sshfwd.go:182-184`、`201-241` |
 | TLS 终结、自建 CA、伪造叶证书 | `tlsterm.go`(`forgedHost` 在 `44`) |
 | 凭证注入、剥头、path 透传 | `main.go:46-59`、`124-202` |
-| 两个主机名单及默认值 | `config.go:27-37`、`141-147` |
+| 两份写死的主机名单(注入 / 盲转发) | `proxy.go:29-64`(启动时打印在 `main.go:110-112`) |

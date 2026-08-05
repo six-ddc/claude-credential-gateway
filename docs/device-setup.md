@@ -376,7 +376,8 @@ curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || \
 必然失败，还会重试、拖慢启动。
 
 > **设备上的全部 HTTPS 流量都会经过网关**：遥测、WebFetch 抓的网页、MCP server 全走这条代理，
-> 没有从你本机 IP 直连出去的旁路。能出到哪些站点由网关的 `proxy.tunnel_hosts` 决定，
+> 没有从你本机 IP 直连出去的旁路。能出到哪些站点由网关代码里的盲转发名单决定，名单只放行
+> Claude Code 自身要用的那些主机，抓名单外的站点会拿到 403（要加得找管理员改网关代码）。
 > 只有 `api.anthropic.com` 会被网关解密并换上真凭证，其余都是不解密的 TCP 盲转发。
 
 ---
@@ -454,6 +455,17 @@ GATEWAY_HOST=... GATEWAY_HOST_KEY_FP='SHA256:...' ./scripts/setup-device.sh lapt
 环境里有残留的 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`——它会让客户端改发 `x-api-key`，
 和网关注入的 Bearer 头冲突。`ccgw` 内部会 unset 这几个，但如果你是**手动**设环境变量跑 `claude`，
 就得自己清干净。用 `ccgw` 就不会有这个问题。
+
+### WebFetch 抓不到某个网站 / 第三方 MCP server 连不上
+
+网关只放行 Claude Code 自身要用的那些主机，其它目标一律 403。确认一下是不是撞在这上面：
+
+```bash
+curl -sv -x http://127.0.0.1:8788 https://example.com 2>&1 | grep -i '403\|host not permitted'
+```
+
+看到 `host not permitted by gateway` 就是名单拦的，响应 body 里带被拒的主机名。名单写死在网关
+代码里，要放行得找管理员改代码重新部署——这是有意的设计，不是配置漏了。
 
 ### `/usage` 显示 "only available for subscription plans"
 
