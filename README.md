@@ -120,19 +120,39 @@ GATEWAY_HOST=你的网关 GATEWAY_HOST_KEY_FP='SHA256:xxxx' \
   ./scripts/setup-device.sh laptop-1
 ```
 
-脚本会核对指纹(不符即中止)、建隧道、经隧道自取 CA 证书、验证链路,最后打印跑 `claude`
-需要的环境变量:
+脚本会核对指纹(不符即中止)、建隧道、经隧道自取 CA 证书、验证链路、检查 Claude Code 版本,
+最后生成一个**包装命令** `~/.ccgw/bin/ccgw` —— 那一堆 `unset`/`export` 都收在里面,不用手敲:
 
 ```bash
-unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+export PATH="$HOME/.ccgw/bin:$PATH"    # 加进 ~/.zshrc 或 ~/.bashrc,一次即可
+
+ccgw                                   # 等价于「经网关的 claude」
+ccgw -p "写个快排"                      # 参数原样透传
+```
+
+真的 `claude` 命令**不受影响**(仍然直连官方),两者并存、互不干扰。
+
+> 只想要交互式 shell 里的别名也行:`alias ccgw="$HOME/.ccgw/bin/ccgw"`。但推荐 PATH 形态 ——
+> 别名在脚本、`make`、编辑器插件等子进程里不生效。
+>
+> **别把它命名成 `cc`**:`/usr/bin/cc` 是 C 编译器,抢占它会让 `make`、cgo、npm 原生模块
+> 全部走岔。要改名用 `CMD_NAME=xxx ./scripts/setup-device.sh laptop-1`,脚本会做同名冲突检测。
+
+包装命令做的事(等价于手动设这些):
+
+```bash
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
 export ANTHROPIC_UNIX_SOCKET=$HOME/.ccgw-laptop-1.sock
 export NODE_EXTRA_CA_CERTS=$HOME/.ccgw/ccgw_ca.crt
 export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-placeholder'
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-claude
+exec claude "$@"
 ```
 
-> 设备密钥与 CA 存 `~/.ccgw/`(不进仓库)。隧道断了重跑脚本即可。
+外加两个启动前自检:socket 不在就提示「重跑 setup-device.sh 建隧道」,CA 缺失同理 ——
+比让 `claude` 抛一个含糊的连接错误好定位。
+
+> 设备密钥与 CA 存 `~/.ccgw/`(不进仓库)。隧道断了重跑脚本即可,包装命令会一并重建。
 >
 > **占位凭证不能省**:`claude` 自己要求手里有凭证才肯启动,什么都不设会停在
 > `Not logged in · Please run /login`。网关不校验它、只覆盖,所有设备填同一个假值即可。
@@ -147,6 +167,15 @@ claude
 > **在源头就不发**,顺带禁掉错误上报、`/feedback`、DesignSync、Projects、自动更新检查等依赖
 > claude.ai 的功能。若只想关遥测但保留这些功能,退一档用 `DISABLE_TELEMETRY=1` —— 源码里
 > GrowthBook 拉取以「遥测未关」为前提,所以它同样会停,只是错误上报、更新检查等仍直连。
+>
+> **客户端版本下限 `>= 2.1.197`**:脚本会检查 `claude --version`,低于就告警(不中止 ——
+> 隧道本身已经好了)。v2.1.91(2026-04-02)~v2.1.196 的客户端在设了 `ANTHROPIC_BASE_URL` 时,
+> 会读系统时区、提取代理主机名与两份加密列表比对,再把结果隐写进系统提示词
+> `Today's date is ...` 那一行(日期分隔符 `-`↔`/`,撇号在 U+0027/2019/02BC/02B9 间切换)发给上游;
+> 官方 v2.1.197 已移除。**socket 形态不设 `ANTHROPIC_BASE_URL`,本就不在触发面上**,但明文调试
+> 形态会;且网关是透明转发、不改写请求体,客户端埋进 body 的任何标记都会绑着真凭证送达上游。
+> 详见 [docs/anthropic-unix-socket.md](docs/anthropic-unix-socket.md)。用
+> `MIN_CLAUDE_VERSION=x.y.z` 可覆盖这个下限。
 
 ## 两种传输形态
 
@@ -173,6 +202,12 @@ claude
 
 `ANTHROPIC_BASE_URL` 在这个形态下**不能省** —— 不设它,`claude` 会拿占位 token 直连官方 API,
 直接 401,网关被整个绕过。
+
+> **明文形态请只当调试用**,暴露面严格大于 socket 形态:它必须设 `ANTHROPIC_BASE_URL`,而客户端
+> 里若干逻辑正是以「设了非官方 base URL」为入口 —— 比如 GrowthBook 用户属性里的
+> `apiBaseUrlHost`(把代理主机名连同 deviceId/accountUUID/email 一起上报,v2.1.220 仍在),
+> 以及旧版那套隐写标记。socket 形态下 `ANTHROPIC_BASE_URL` 未设,这些分支取不到值。
+> 日常请用脚本生成的 `ccgw`(socket 形态)。
 
 > 两种形态下 `-L` 右边的目标(`127.0.0.1:8788` / `/run/ccgw.sock`)都必须在网关
 > `ssh.permit_targets` 里。它们只是白名单口令,网关并不真监听这些地址。
