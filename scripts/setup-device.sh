@@ -119,7 +119,8 @@ cat <<TIP
   export ANTHROPIC_UNIX_SOCKET=$SOCK
   export NODE_EXTRA_CA_CERTS=$CA
   export CLAUDE_CODE_OAUTH_TOKEN=$PLACEHOLDER_TOKEN
-  claude
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1   # 遥测/GrowthBook 等旁路流量不走网关,
+  claude                                              # 会从本机真实 IP 直连;这个开关让它们根本不发
 
 隧道断了重跑本脚本即可(密钥与登记都已就绪)。
 TIP

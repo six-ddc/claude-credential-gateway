@@ -121,13 +121,14 @@ GATEWAY_HOST=你的网关 GATEWAY_HOST_KEY_FP='SHA256:xxxx' \
 ```
 
 脚本会核对指纹(不符即中止)、建隧道、经隧道自取 CA 证书、验证链路,最后打印跑 `claude`
-需要的三个环境变量:
+需要的环境变量:
 
 ```bash
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
 export ANTHROPIC_UNIX_SOCKET=$HOME/.ccgw-laptop-1.sock
 export NODE_EXTRA_CA_CERTS=$HOME/.ccgw/ccgw_ca.crt
 export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-placeholder'
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 claude
 ```
 
@@ -138,6 +139,14 @@ claude
 > `CLAUDE_CODE_OAUTH_TOKEN` 与 `ANTHROPIC_API_KEY` 设哪个都能跑(网关会剥掉客户端的
 > `x-api-key` 再注入真凭证),但**建议用前者** —— 它让客户端走订阅分支、带上 `oauth-2025`
 > beta 头,与网关注入的订阅 token 形状一致,这也是官方 `claude ssh` 的做法。
+>
+> **旁路流量要关**:`ANTHROPIC_UNIX_SOCKET`/`ANTHROPIC_BASE_URL` 只接管 API 主链路;遥测
+> (`event_logging/batch`)和 GrowthBook 特性开关拉取是独立的直连请求,从设备**真实 IP** 发出
+> (GrowthBook 那路还会把占位 token 以 Bearer 带给 `api.anthropic.com`,虽被 401 但暴露 IP)。
+> `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 让客户端进入 essential-traffic 模式,这些请求
+> **在源头就不发**,顺带禁掉错误上报、`/feedback`、DesignSync、Projects、自动更新检查等依赖
+> claude.ai 的功能。若只想关遥测但保留这些功能,退一档用 `DISABLE_TELEMETRY=1` —— 源码里
+> GrowthBook 拉取以「遥测未关」为前提,所以它同样会停,只是错误上报、更新检查等仍直连。
 
 ## 两种传输形态
 
@@ -158,6 +167,7 @@ ssh -N -L 8788:127.0.0.1:8788 -p 2222 -i ~/.ccgw/ccgw_laptop-1 laptop-1@网关�
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_UNIX_SOCKET
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
 export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-placeholder'
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 claude
 ```
 
