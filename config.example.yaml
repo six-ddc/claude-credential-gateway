@@ -10,15 +10,29 @@ upstream:
   # 留空则用环境变量 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入。
   oauth: ""
 
+# 正向代理(设备侧 HTTPS_PROXY 指向隧道口)。两个名单都支持 "*"、"*.example.com"
+# 与精确主机名三种写法。
+proxy:
+  # 解密并注入真凭证的主机。客户端无论怎么配,URL 里的主机名始终是 api.anthropic.com。
+  # 只该放它 —— 多放一个就等于把真凭证送到那个域名去。
+  mitm_hosts:
+    - api.anthropic.com
+  # 只做 TCP 盲转发、不解密也不注入凭证的主机。
+  # 设了 HTTPS_PROXY 之后客户端的【全部】 https 流量都会经过网关(遥测、WebFetch 抓的
+  # 任意站点、MCP server),这里决定放行到哪儿。默认 "*" 全放行:设备已经过 SSH 公钥
+  # 认证,而收紧它会直接弄坏 WebFetch 这类功能。要收紧就把 "*" 换成具体域名列表。
+  tunnel_hosts:
+    - "*"
+
 # 转发-only SSH 层:唯一对外入口(始终启用)。设备身份 = SSH 公钥,单一数据源就是下面的
-# authorized_keys;客户端 CLAUDE_CODE_OAUTH_TOKEN 填任意占位值即可(网关不校验,只覆盖)。
+# authorized_keys;客户端发的占位凭证网关不校验,只覆盖。
 # 公钥认证、只能转发到 permit_target、无 shell/exec、禁 -R。详见 docs/ssh-forward-gateway.md。
 ssh:
   addr: ":2222"                       # 唯一对外端口
   host_key: ./ssh_host_ed25519_key    # 服务端私钥(机密,已 gitignore);不存在则首启自动生成
   ca_key: ./ccgw_ca_key               # TLS 终结 CA(机密);自动生成,另导出 ccgw_ca_key.crt 给设备信任
   # 转发白名单:客户端 -L 声明的目标须在其中(网关并不真监听它们)。
-  # 两项分别对应两种客户端形态:ANTHROPIC_BASE_URL(明文)与 ANTHROPIC_UNIX_SOCKET(TLS)。
+  # tcp 那项是代理形态用的;unix 那项留着兼容老设备的 ANTHROPIC_UNIX_SOCKET 形态。
   permit_targets:
     - 127.0.0.1:8788
     - unix:/run/ccgw.sock

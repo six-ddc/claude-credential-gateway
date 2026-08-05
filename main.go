@@ -54,6 +54,8 @@ var stripHeaders = map[string]bool{
 	// Authorization,不剥掉的话上游拿假 key 校验 → 401 "API key is invalid"。
 	// 凭证一律由网关注入,客户端的任何凭证企图都不该到上游。
 	"x-api-key": true,
+	// 代理形态特有:这是客户端发给【代理】的,不该转给上游。
+	"proxy-authorization": true,
 }
 
 func main() {
@@ -105,6 +107,8 @@ func main() {
 	log.Printf("SSH host key 指纹: %s(设备首连时比对)", sshSrv.fingerprint)
 	log.Printf("TLS 终结 CA: %s(设备经隧道 GET /ca 自取)", sshSrv.ca.certPath)
 	caCertPEM = sshSrv.ca.certPEM
+	log.Printf("代理: 解密注入 %s;盲转发 %s",
+		strings.Join(cfg.Proxy.MITMHosts, ", "), strings.Join(cfg.Proxy.TunnelHosts, ", "))
 	log.Printf("注入: 订阅 OAuth token (len=%d)", len(cfg.Upstream.OAuth))
 	ids := make([]string, 0, len(cfg.SSH.AuthorizedKeys))
 	for _, ak := range cfg.SSH.AuthorizedKeys {
@@ -129,6 +133,13 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CONNECT 在连接层(serveTunnelConn)就处理掉了,到不了这里 —— 真到了说明
+	// 分派逻辑有漏,明说比默默当成普通请求转出去强。
+	if r.Method == http.MethodConnect {
+		writeError(w, 501, "CONNECT should be handled at the tunnel layer")
+		return
+	}
+
 	switch r.URL.Path {
 	case "/status":
 		// 最近采样到的订阅限额快照(5h/7d 还剩多少、几点重置)
@@ -142,6 +153,16 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 明文 HTTP 经代理时是绝对形式请求(GET http://host/path)。目标不是我们打算
+	// 解密的主机就拒掉 —— 否则真凭证会被注入到一个跟 Anthropic 无关的目标上。
+	// (https 走 CONNECT,在上面就分流了,到不了这里。)
+	if r.URL.IsAbs() && !hostInList(cfg.Proxy.MITMHosts, hostnameOf(r.URL.Host)) {
+		writeError(w, 403, "host not permitted: "+r.URL.Host)
+		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "proxy_host",
+			"user": device, "host": r.URL.Host})
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, 400, "read body failed")
@@ -152,11 +173,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// 2) 模型(仅审计;真正的 token 用量从响应解析)
 	reqModel := gjson.GetBytes(body, "model").String()
 
-	// 3) 上游 path
-	path := "/v1/messages"
-	if strings.HasPrefix(r.URL.Path, "/v1/") {
-		path = r.URL.RequestURI()
-	}
+	// 3) 上游 path —— 原样透传。
+	//    以前这里把非 /v1/ 的路径一律改写成 /v1/messages,于是 /api/oauth/usage
+	//    (/usage 命令查额度用的)会被悄悄换成一个 GET /v1/messages 打到上游,
+	//    客户端拿到的报错跟它请求的端点毫无关系,极难排查。代理形态下客户端
+	//    要打哪个端点就转哪个。
+	path := r.URL.RequestURI()
 
 	// 4) 构造上游请求 —— 注入真凭证,剥掉客户端凭证企图
 	upReq, err := http.NewRequest(r.Method, upstreamURL.Scheme+"://"+upstreamURL.Host+path, bytes.NewReader(body))

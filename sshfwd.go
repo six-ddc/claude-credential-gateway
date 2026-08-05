@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
@@ -24,6 +25,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -165,7 +167,11 @@ func (a tunnelAddr) Network() string { return "ssh-tunnel" }
 func (a tunnelAddr) String() string  { return a.remote + "/" + a.device }
 
 // channelConn 把一个 SSH 转发 channel 包装成 net.Conn,携带设备身份。
-// deadline 是 no-op:ssh.Channel 不支持,进程内直连也用不上。
+//
+// deadline 是 no-op:ssh.Channel 不支持。注意这不是纯粹的形式主义 —— Go 的
+// http.Server 在 Hijack 时要靠「把读 deadline 设成过去」来打断自己的后台预读,
+// 在这里那一步不起作用,Hijack() 会挂死。所以 CONNECT 在 serveTunnelConn 里
+// 就地处理,绝不能丢进 handler 再 Hijack。
 type channelConn struct {
 	ssh.Channel
 	addr tunnelAddr
@@ -189,22 +195,72 @@ func (c *peekConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 // peekTimeout 是等客户端说第一句话的上限,防止空闲 channel 永久占着 goroutine。
 const peekTimeout = 30 * time.Second
 
-// sniffTunnelConn 窥探首字节决定这条隧道连接怎么读:
-// 0x16 是 TLS handshake record(ANTHROPIC_UNIX_SOCKET 形态)→ 交给 TLS 终结;
-// 其余按明文 HTTP(ANTHROPIC_BASE_URL 形态)。TLS 握手本身留给 http.Server 的连接 goroutine 做。
-func sniffTunnelConn(c net.Conn, tlsConf *tls.Config) (net.Conn, error) {
+// connectPrefix 是 HTTP 代理形态的开场白。
+const connectPrefix = "CONNECT "
+
+// serveTunnelConn 窥探开头几个字节,决定这条隧道连接怎么处理,并把该交给 HTTP Server
+// 的那些塞回监听器。三种形态:
+//
+//	0x16        TLS handshake record —— 老的 ANTHROPIC_UNIX_SOCKET 形态,连上来直接握手;
+//	"CONNECT "  HTTP 代理形态(HTTPS_PROXY)—— 就地应答并按需 TLS 终结/盲转发;
+//	其余        明文 HTTP(取 CA、调试)。
+//
+// CONNECT 必须在这一层处理干净,不能丢给 http.Server 的 handler 去 Hijack:
+// Go 的 hijack 路径要先 abortPendingRead(),它靠把读 deadline 设成过去来打断后台预读,
+// 而 channelConn 的 deadline 是 no-op(ssh.Channel 不支持)—— 那个预读永远打不断,
+// Hijack() 会一直阻塞到连接被对端关掉为止。
+func (s *sshServer) serveTunnelConn(c net.Conn, device string) {
 	guard := time.AfterFunc(peekTimeout, func() { c.Close() })
-	var first [1]byte
-	_, err := io.ReadFull(c, first[:])
-	guard.Stop()
+	br := bufio.NewReader(c)
+
+	first, err := br.Peek(1)
 	if err != nil {
-		return nil, err
+		guard.Stop()
+		c.Close()
+		return
 	}
-	pc := &peekConn{Conn: c, r: io.MultiReader(bytes.NewReader(first[:]), c)}
-	if first[0] == 0x16 && tlsConf != nil {
-		return tls.Server(pc, tlsConf), nil
+	if first[0] == 0x16 && s.tlsConf != nil {
+		guard.Stop()
+		s.pushTunnel(tls.Server(replayBuffered(c, br), s.tlsConf))
+		return
 	}
-	return pc, nil
+
+	if head, err := br.Peek(len(connectPrefix)); err == nil && string(head) == connectPrefix {
+		req, err := http.ReadRequest(br)
+		guard.Stop()
+		if err != nil {
+			c.Close()
+			return
+		}
+		s.handleConnect(c, br, req, device)
+		return
+	}
+
+	guard.Stop()
+	s.pushTunnel(replayBuffered(c, br))
+}
+
+// pushTunnel 把一条连接交给进程内 HTTP Server;服务正在退出就直接关掉。
+func (s *sshServer) pushTunnel(c net.Conn) {
+	if !s.tunnels.push(c) {
+		c.Close()
+	}
+}
+
+// replayBuffered 把 bufio 里已经预读的字节接回连接头部,让后续读取看到完整的字节流。
+func replayBuffered(c net.Conn, br *bufio.Reader) net.Conn {
+	n := br.Buffered()
+	if n == 0 {
+		return c
+	}
+	head, err := br.Peek(n)
+	if err != nil {
+		return c
+	}
+	// Peek 给的是内部缓冲区的切片,要留着用就得拷一份。
+	buf := make([]byte, n)
+	copy(buf, head)
+	return &peekConn{Conn: c, r: io.MultiReader(bytes.NewReader(buf), c)}
 }
 
 // channelListener 把转发 channel 当作 Accept 出来的连接,喂给 http.Server.Serve。
@@ -414,14 +470,5 @@ func (s *sshServer) acceptForward(newCh ssh.NewChannel, sc *ssh.ServerConn, devi
 		"user": device, "target": target})
 	conn := &channelConn{Channel: ch, addr: tunnelAddr{device: device, remote: sc.RemoteAddr().String()}}
 	// 嗅探要等客户端先说话,放到独立 goroutine,别卡住这条 SSH 连接的 channel 分发循环。
-	go func() {
-		wrapped, err := sniffTunnelConn(conn, s.tlsConf)
-		if err != nil {
-			conn.Close()
-			return
-		}
-		if !s.tunnels.push(wrapped) {
-			wrapped.Close() // 服务正在退出
-		}
-	}()
+	go s.serveTunnelConn(conn, device)
 }

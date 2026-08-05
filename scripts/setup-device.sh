@@ -21,22 +21,26 @@ GATEWAY_SSH_PORT=${GATEWAY_SSH_PORT:-2222}          # 网关 ssh.addr 的端口
 GATEWAY_HOST_KEY_FP=${GATEWAY_HOST_KEY_FP:-}        # 管理员给的 host key 指纹(SHA256:...)
 
 # ---- 一般不用改 ----------------------------------------------------------
-# 这两个目标须在网关 ssh.permit_targets 里。它们只是白名单口令,网关并不真监听。
+# 这个目标须在网关 ssh.permit_targets 里。它只是白名单口令,网关并不真监听。
 PERMIT_TCP=${PERMIT_TCP:-127.0.0.1:8788}
-PERMIT_SOCKET=${PERMIT_SOCKET:-/run/ccgw.sock}
-LOCAL_HTTP_PORT=${LOCAL_HTTP_PORT:-8788}            # 本机明文入口(取 CA / 调试用)
+LOCAL_PROXY_PORT=${LOCAL_PROXY_PORT:-8788}          # 本机代理入口,给 HTTPS_PROXY 用
 PLACEHOLDER_TOKEN=${PLACEHOLDER_TOKEN:-sk-ant-oat01-placeholder}
+# 占位凭证声明的订阅档位。只影响 /usage 面板显示哪几条限额条,不影响能否取到数据。
+SUBSCRIPTION_TYPE=${SUBSCRIPTION_TYPE:-max}
 
 # 生成的包装命令名。不叫 claude(会和真命令递归),也不建议叫 cc —— /usr/bin/cc 是 C 编译器,
 # 抢占它会让 make/cgo/npm 原生模块全部走岔。改名用 CMD_NAME=xxx 覆盖,脚本会做冲突检测。
 CMD_NAME=${CMD_NAME:-ccgw}
 
-# 设备端 Claude Code 版本下限。v2.1.91(2026-04-02)~v2.1.196 期间,客户端在配置了非官方
-# API 端点时会读系统时区、提取代理主机名,把比对结果隐写进系统提示词 "Today's date is ..."
-# 那一行(日期分隔符 - / ,撇号在 U+0027/2019/02BC/02B9 之间切换)。官方 v2.1.197 已移除。
-# 本网关默认的 socket 形态不设 ANTHROPIC_BASE_URL,本就不在触发面上;但设备若用明文形态
-# 调试,旧版仍会打标。统一要求 >= 2.1.197 最省心。详见 docs/anthropic-unix-socket.md。
+# 设备端 Claude Code 版本下限 —— 代理形态下这是硬性要求,不是建议。
+# v2.1.91(2026-04-02)~v2.1.196 期间,客户端在配置了非官方 API 端点时会读系统时区、
+# 【提取代理主机名】,把比对结果隐写进系统提示词 "Today's date is ..." 那一行
+# (日期分隔符 - / ,撇号在 U+0027/2019/02BC/02B9 之间切换)。官方 v2.1.197 已移除。
+# 老的 socket 形态不设代理,不在触发面上;换成 HTTPS_PROXY 之后【每次调用都在】,
+# 所以这里改成直接中止。确实要用旧版就显式设 ALLOW_OLD_CLAUDE=1 自担后果。
+# 详见 docs/anthropic-unix-socket.md。
 MIN_CLAUDE_VERSION=${MIN_CLAUDE_VERSION:-2.1.197}
+ALLOW_OLD_CLAUDE=${ALLOW_OLD_CLAUDE:-}
 
 DEVICE_ID=${1:-$(hostname -s | tr '[:upper:]' '[:lower:]')-dev}
 # 设备凭证放家目录,不放仓库 —— 私钥永远不该进版本库。
@@ -44,9 +48,13 @@ CCGW_HOME=${CCGW_HOME:-$HOME/.ccgw}
 KEY="$CCGW_HOME/ccgw_${DEVICE_ID}"
 CA="$CCGW_HOME/ccgw_ca.crt"
 KNOWN_HOSTS="$CCGW_HOME/known_hosts"
-SOCK="$HOME/.ccgw-${DEVICE_ID}.sock"   # 放 $HOME:unix socket 路径有长度上限
 BIN_DIR="$CCGW_HOME/bin"
 WRAPPER="$BIN_DIR/$CMD_NAME"
+# 独立的 CLAUDE_CONFIG_DIR:占位凭证只放这儿,绝不碰你真的 ~/.claude/.credentials.json。
+# (macOS 上 keychain 的 service name 会按 CLAUDE_CONFIG_DIR 的路径 hash 加后缀,
+#  查不到条目就 fallback 到明文文件 —— 所以这一招在 macOS 和 Linux 上都成立。)
+CLAUDE_HOME="$CCGW_HOME/claude-home"
+REAL_CLAUDE_HOME="${REAL_CLAUDE_HOME:-$HOME/.claude}"
 
 if [ "$CMD_NAME" = "claude" ]; then
   echo "✗ CMD_NAME 不能叫 claude —— 包装脚本内部要调真的 claude,同名会无限递归。" >&2
@@ -106,16 +114,15 @@ fi
 # 只把核对过的那把写进 known_hosts,后续连接严格校验
 awk -v h="[$GATEWAY_HOST]:$GATEWAY_SSH_PORT" '{print h, $2, $3}' "$HK" > "$KNOWN_HOSTS"
 
-# ③ 建隧道。同时开两个转发:明文口(取 CA / 调试)+ unix socket(跑 claude)
+# ③ 建隧道。一个本地端口就够了 —— 它同时当代理入口和取 CA 的明文口
+#   (网关按开头字节分辨:"CONNECT " 走代理协议,其余按普通 HTTP)。
 pkill -f "ssh.*ccgw_${DEVICE_ID} " 2>/dev/null || true
-rm -f "$SOCK"
 if ! ssh -f -N \
-  -L "$LOCAL_HTTP_PORT:$PERMIT_TCP" \
-  -L "$SOCK:$PERMIT_SOCKET" \
+  -L "$LOCAL_PROXY_PORT:$PERMIT_TCP" \
   -p "$GATEWAY_SSH_PORT" -i "$KEY" \
   -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=yes \
   -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes \
-  -o StreamLocalBindUnlink=yes -o ServerAliveInterval=30 \
+  -o ServerAliveInterval=30 \
   -o ControlMaster=no -o ControlPath=none \
   "$DEVICE_ID@$GATEWAY_HOST" 2>/dev/null
 then
@@ -134,36 +141,47 @@ $(cat "$KEY.pub")
 EOF
   exit 1
 fi
-echo "== 隧道已建立: 127.0.0.1:$LOCAL_HTTP_PORT(明文)、$SOCK(TLS)→ $GATEWAY_HOST:$GATEWAY_SSH_PORT"
+echo "== 隧道已建立: 127.0.0.1:$LOCAL_PROXY_PORT → $GATEWAY_HOST:$GATEWAY_SSH_PORT"
 
-# ④ 经【已认证的隧道】自取 CA 证书。走明文口:SSH 已经认证并加密了这一跳,
+# ④ 经【已认证的隧道】自取 CA 证书。发普通 HTTP:SSH 已经认证并加密了这一跳,
 #    所以拿到的 CA 是可信的,不需要任何带外分发,也不需要登录网关机。
-if ! curl -sf -m 10 "http://127.0.0.1:$LOCAL_HTTP_PORT/ca" -o "$CA" || [ ! -s "$CA" ]; then
+if ! curl -sf -m 10 "http://127.0.0.1:$LOCAL_PROXY_PORT/ca" -o "$CA" || [ ! -s "$CA" ]; then
   echo "✗ 取 CA 失败(网关版本太旧?需要支持 GET /ca)" >&2
   exit 1
 fi
 echo "== 网关 CA: $CA ($(openssl x509 -in "$CA" -noout -subject | sed 's/^subject=//'))"
 
-# ⑤ 验证链路:经 socket + TLS 打 /status
-STATUS=$(curl -s -m 5 --unix-socket "$SOCK" --cacert "$CA" https://api.anthropic.com/status)
+# ⑤ 验证链路:完整走一遍客户端要走的路 —— CONNECT + TLS 终结 + 校验网关 CA。
+STATUS=$(curl -s -m 5 -x "http://127.0.0.1:$LOCAL_PROXY_PORT" --cacert "$CA" \
+  https://api.anthropic.com/status) || {
+  echo "✗ 经代理访问 /status 失败(网关版本太旧?需要支持 CONNECT)" >&2
+  exit 1
+}
 echo "== /status: $STATUS"
 
-# ⑥ 检查设备端 Claude Code 版本(只告警不中止 —— 隧道本身已经好了,
-#    而且这台机器可能还没装 claude、或稍后才装)
+# ⑥ 检查设备端 Claude Code 版本。代理形态下低版本会每次调用都被打标,所以这里中止。
 if CLAUDE_BIN=$(command -v claude 2>/dev/null); then
   # || true 不能省:claude 装坏时 --version 会非零退出,set -euo pipefail 会就地中止整个脚本,
-  # 而此刻隧道已经建好了 —— 版本读不出来只该告警,不该让接入失败。
+  # 而此刻隧道已经建好了 —— 版本读不出来不该让接入直接崩掉。
   CLAUDE_VER=$("$CLAUDE_BIN" --version 2>/dev/null | awk '{print $1}' || true)
   if [ -z "$CLAUDE_VER" ]; then
     echo "⚠ 读不出 claude 版本(claude --version 无输出?),跳过版本检查。"
   elif ver_lt "$CLAUDE_VER" "$MIN_CLAUDE_VERSION"; then
-    cat >&2 <<WARN
-⚠ Claude Code 版本偏低: $CLAUDE_VER < $MIN_CLAUDE_VERSION,建议升级。
-  v2.1.91~v2.1.196 的客户端在设了 ANTHROPIC_BASE_URL 时会读系统时区、提取代理主机名,
-  把比对结果隐写进系统提示词发给上游;v2.1.197 已移除。
-  本脚本默认的 socket 形态不设 ANTHROPIC_BASE_URL,不在触发面上;但明文调试形态会。
+    if [ -n "$ALLOW_OLD_CLAUDE" ]; then
+      echo "⚠ Claude Code $CLAUDE_VER < $MIN_CLAUDE_VERSION,已按 ALLOW_OLD_CLAUDE=1 放行(自担后果)。"
+    else
+      cat >&2 <<WARN
+✗ Claude Code 版本过低: $CLAUDE_VER < $MIN_CLAUDE_VERSION。
+
+  v2.1.91~v2.1.196 的客户端一旦发现配了代理,就会读系统时区、提取代理主机名,
+  把比对结果隐写进系统提示词发给上游(v2.1.197 已移除)。老的 socket 形态不设代理、
+  碰不到这条;本脚本改用 HTTPS_PROXY 之后【每次调用都会命中】,所以这里直接中止。
+
   升级: npm i -g @anthropic-ai/claude-code   (或按你的安装方式)
+  确实要用旧版: ALLOW_OLD_CLAUDE=1 $0 $DEVICE_ID
 WARN
+      exit 1
+    fi
   else
     echo "== Claude Code 版本: $CLAUDE_VER (>= $MIN_CLAUDE_VERSION,OK)"
   fi
@@ -171,30 +189,75 @@ else
   echo "⚠ 没找到 claude 命令,跳过版本检查。装好后请确认版本 >= $MIN_CLAUDE_VERSION。"
 fi
 
-# ⑦ 生成包装命令 —— 把那一堆 unset/export 收进一个可执行文件,
+# ⑦ 占位凭证。这是 socket 形态换成代理形态后最关键的一步。
+#
+#    以前用 CLAUDE_CODE_OAUTH_TOKEN 当占位,但客户端走 env token 分支时会把 scopes
+#    硬编码成 ['user:inference'],凭证文件根本不读。而 /usage 要求 scopes 里有
+#    'user:profile',拿不到就直接返回空、连请求都不发 —— 这正是 /usage 一直显示
+#    "only available for subscription plans" 的原因。改成写凭证文件才能自己定 scopes。
+#
+#    放独立的 CLAUDE_CONFIG_DIR 里,不动你真的 ~/.claude/.credentials.json。
+mkdir -p "$CLAUDE_HOME"
+chmod 700 "$CLAUDE_HOME"
+
+# 真 ~/.claude 里与凭证无关的东西链过来,保住设置/记忆/历史/MCP 配置。
+# 只链不拷:那边改了这边立刻跟着变。已存在的条目不动,反复跑本脚本是幂等的。
+if [ -d "$REAL_CLAUDE_HOME" ]; then
+  for item in settings.json CLAUDE.md commands agents skills plugins projects todos statsig; do
+    src="$REAL_CLAUDE_HOME/$item"
+    dst="$CLAUDE_HOME/$item"
+    if [ -e "$src" ] && [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
+      ln -s "$src" "$dst"
+    fi
+  done
+fi
+
+# expiresAt 设到 2100 年、且不给 refreshToken:两条各自都能让客户端不去刷新。
+# (刷新会拿占位 refresh token 去打 platform.claude.com,必然失败,还要重试拖慢启动。)
+cat > "$CLAUDE_HOME/.credentials.json" <<CRED
+{
+  "claudeAiOauth": {
+    "accessToken": "$PLACEHOLDER_TOKEN",
+    "expiresAt": 4102444800000,
+    "scopes": ["user:inference", "user:profile"],
+    "subscriptionType": "$SUBSCRIPTION_TYPE"
+  }
+}
+CRED
+chmod 600 "$CLAUDE_HOME/.credentials.json"
+echo "== 占位凭证: $CLAUDE_HOME/.credentials.json (scopes 含 user:profile,/usage 才肯发请求)"
+
+# ⑧ 生成包装命令 —— 把那一堆 unset/export 收进一个可执行文件,
 #    不碰 shell 配置、不影响真的 claude(它仍然直连官方)。
 cat > "$WRAPPER" <<WRAP
 #!/usr/bin/env bash
 # 由 scripts/setup-device.sh 自动生成(设备 $DEVICE_ID) —— 请勿手改,重跑脚本会覆盖。
-# 经 ccgw 网关跑 claude:换传输层 + 信任网关 CA + 占位凭证 + 关旁路遥测。
+# 经 ccgw 网关跑 claude:走代理 + 信任网关 CA + 独立配置目录里的占位凭证。
 set -euo pipefail
 
-SOCK="$SOCK"
+PROXY="http://127.0.0.1:$LOCAL_PROXY_PORT"
 CA="$CA"
+CLAUDE_HOME="$CLAUDE_HOME"
 
-[ -S "\$SOCK" ] || { echo "✗ 隧道未就绪(\$SOCK 不存在)。重跑 setup-device.sh 建隧道。" >&2; exit 1; }
-[ -s "\$CA" ]   || { echo "✗ CA 缺失(\$CA)。重跑 setup-device.sh。" >&2; exit 1; }
+curl -sf -m 5 "\$PROXY/status" >/dev/null 2>&1 || {
+  echo "✗ 隧道未就绪(\$PROXY 连不上)。重跑 setup-device.sh 建隧道。" >&2; exit 1; }
+[ -s "\$CA" ] || { echo "✗ CA 缺失(\$CA)。重跑 setup-device.sh。" >&2; exit 1; }
 
-# 这四个必须清掉:任何一个残留都会让 claude 绕开网关或改用 x-api-key 形状
+# 这几个必须清掉,任何一个残留都会让 claude 绕开网关或改用 x-api-key 形状。
+# CLAUDE_CODE_OAUTH_TOKEN 尤其要清:设了它客户端就走 env 分支,scopes 被硬编码成
+# 只有 user:inference,凭证文件不读,/usage 直接拿不到数据。
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
+unset ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN
 
-export ANTHROPIC_UNIX_SOCKET="\$SOCK"
+# 代理同时覆盖两条 HTTP 栈:全局 axios(/usage、profile、bootstrap 等)和
+# undici/fetch(SDK 的 /v1/messages)。socket 形态只覆盖后者,这正是要换的原因。
+export HTTPS_PROXY="\$PROXY" HTTP_PROXY="\$PROXY"
+export https_proxy="\$PROXY" http_proxy="\$PROXY"
 export NODE_EXTRA_CA_CERTS="\$CA"
-export CLAUDE_CODE_OAUTH_TOKEN="$PLACEHOLDER_TOKEN"
-# 遥测/GrowthBook 走 axios 直连、从本机真实 IP 发出,且会上报 apiBaseUrlHost 等属性;
-# 这个开关让它们在源头就不发。
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CONFIG_DIR="\$CLAUDE_HOME"
 
+# 注意:这里【不】关旁路遥测。以前关是因为它走 axios 直连、会从设备真实 IP 发出;
+# 现在代理把 axios 也收编了,遥测和 API 调用一样从网关出口走,没有旁路可言了。
 exec claude "\$@"
 WRAP
 chmod 755 "$WRAPPER"
