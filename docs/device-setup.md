@@ -34,16 +34,59 @@ done
 
 缺 `pkill` 的话（少数精简 Linux 镜像）装 `procps`：`apt install procps` / `yum install procps-ng`。
 
-### 装 Claude Code，版本要 ≥ 2.1.197
+### Claude Code：先查现状，再决定要不要动
+
+**别上来就装。** 很多机器已经装过了，盲目再装一遍容易搞出两份不同来源的安装（npm 一份、
+原生安装器一份），后面排查问题会很痛苦。先看现状：
 
 ```bash
-npm i -g @anthropic-ai/claude-code
-claude --version        # 例如：2.1.220 (Claude Code)
+claude --version 2>/dev/null || echo "未安装"
+command -v claude        # 顺便看看装在哪、是哪种安装方式
 ```
 
-**为什么要卡版本**：v2.1.91 ~ v2.1.196 的客户端在设了 `ANTHROPIC_BASE_URL` 时，会读系统时区、
-提取代理主机名，把比对结果隐写进系统提示词发给上游；官方 v2.1.197 已移除。本教程用的 socket 形态
-不设 `ANTHROPIC_BASE_URL`，本就不在触发面上，但统一卡版本最省心。
+对照下面三种情况处理：
+
+| 现状 | 怎么做 |
+|---|---|
+| 输出 `未安装` | 按下面「首次安装」装一份 |
+| 版本 **≥ 2.1.197** | ✅ 什么都不用做，直接进第 1 步 |
+| 版本 **< 2.1.197** | 按下面「升级」升一下 |
+
+> 记不住版本号也没关系：`setup-device.sh` 跑到第 ⑥ 步会自己检查并告警，
+> 而且**只告警不中止**——隧道该建还是会建好。
+
+**首次安装**（挑一种，别混着来）：
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash    # 官方原生安装器（推荐）
+npm i -g @anthropic-ai/claude-code                # 或者走 npm
+brew install --cask claude-code                   # 或者 macOS Homebrew
+```
+
+**升级**——优先用内置命令，它会自己识别安装方式并走对应路径：
+
+```bash
+claude update            # 别名 claude upgrade：检查并安装更新
+claude doctor            # 升级完不放心可以体检一下安装状态
+```
+
+`claude update` 不灵的话（比如权限不够），按你的安装方式手动来：
+
+| 安装方式 | 升级命令 |
+|---|---|
+| 原生安装器 | `claude install stable` |
+| npm | `npm i -g @anthropic-ai/claude-code` |
+| Homebrew | `brew upgrade claude-code` |
+| mise | `mise upgrade claude` |
+| winget | `winget upgrade Anthropic.ClaudeCode` |
+
+> ⚠️ **注意自动更新会失效**：`ccgw` 会设 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`，
+> 这个开关连带把「检查新版本」的网络请求也停掉了（它本来就是要断掉一切非必要外连）。
+> 所以**只用 `ccgw` 的话，客户端不会再自动更新**，得偶尔手动 `claude update` 一下。
+
+**为什么要卡 2.1.197 这个版本**：v2.1.91 ~ v2.1.196 的客户端在设了 `ANTHROPIC_BASE_URL` 时，
+会读系统时区、提取代理主机名，把比对结果隐写进系统提示词发给上游；官方 v2.1.197 已移除。
+本教程用的 socket 形态不设 `ANTHROPIC_BASE_URL`，本就不在触发面上，但统一卡版本最省心。
 
 ### 拿到接入脚本
 
