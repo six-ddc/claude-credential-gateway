@@ -222,7 +222,7 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
 
 - **身份来自连接本身**。SSH 层公钥认证出的 device id 由 `ConnContext` 写进每个请求的 context;
   客户端 `Authorization` 里的占位 token 不参与鉴权,随后被整个覆盖成真订阅 token。
-- **上游 path 原样透传**(`main.go:181`)。客户端要打哪个端点就转哪个 —— 这是 `/usage` 能工作的前提之一。
+- **上游 path 原样透传**(`main.go:184`)。客户端要打哪个端点就转哪个 —— 这是 `/usage` 能工作的前提之一。
   路径一旦被改写,客户端拿到的报错就跟它请求的端点毫无关系,极难排查。
 - **剥掉客户端的凭证企图**(`main.go:46-59`)。`x-api-key` 必剥:设备上残留的 `ANTHROPIC_API_KEY` 会让
   客户端改发这个头,它优先级高于 `Authorization`,不剥就是上游拿假 key 校验后 401。
@@ -330,5 +330,5 @@ scopes 是字面量写死的(`utils/auth.ts:1266`),keychain 和凭证文件都�
 | CONNECT 分流、盲转发 | `proxy.go`(`handleConnect` 在 `82`) |
 | 首字节分派、deadline no-op 与 Hijack 陷阱 | `sshfwd.go:182-184`、`201-241` |
 | TLS 终结、自建 CA、伪造叶证书 | `tlsterm.go`(`forgedHost` 在 `44`) |
-| 凭证注入、剥头、path 透传 | `main.go:46-59`、`124-194` |
+| 凭证注入、剥头、path 透传 | `main.go:46-59`、`124-202` |
 | 两个主机名单及默认值 | `config.go:27-37`、`141-147` |

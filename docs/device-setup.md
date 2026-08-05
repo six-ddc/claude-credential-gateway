@@ -354,14 +354,17 @@ curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || \
 | 变量 | 值 | 作用 |
 |---|---|---|
 | `HTTPS_PROXY` / `HTTP_PROXY`（含小写） | `http://127.0.0.1:8788` | 把 claude 的全部 HTTP(S) 流量赶进隧道 |
+| `NO_PROXY` / `no_proxy` | `localhost,127.0.0.1,::1` | 本机地址不走代理，否则本地跑的 MCP server / dev server 也会被绕去网关 |
 | `NODE_EXTRA_CA_CERTS` | `~/.ccgw/ccgw_ca.crt` | 信任网关自建 CA（它要终结 `api.anthropic.com` 的 TLS） |
 | `CLAUDE_CONFIG_DIR` | `~/.ccgw/claude-home` | 独立配置目录，占位凭证放这儿，不碰你真的 `~/.claude` |
 | `ANTHROPIC_API_KEY` 等 4 个 | **unset** | 任何残留都会让 claude 绕开网关或改发 `x-api-key` |
-| `ANTHROPIC_UNIX_SOCKET`、`CLAUDE_CODE_OAUTH_TOKEN` | **unset** | 见下 |
+| `ANTHROPIC_UNIX_SOCKET` | **unset** | 残留会让传输层走回 socket，只盖得住 `/v1/messages` |
+| `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` | **unset** | 见下 |
 
-**为什么要 unset `CLAUDE_CODE_OAUTH_TOKEN`**：设了它，客户端就走环境变量凭证分支，scopes 默认
-只有 `user:inference`，凭证文件根本不读。而 `/usage` 要求 scopes 含 `user:profile`，拿不到就
-直接返回空、**连请求都不发**——面板上就是那句 "only available for subscription plans"。
+**为什么要 unset 那两个 OAuth token 变量**：设了其中任何一个，客户端就走环境变量／文件描述符
+凭证分支，scopes 被硬编码成只有 `user:inference`，凭证文件根本不读。而 `/usage` 要求 scopes 含
+`user:profile`，拿不到就直接返回空、**连请求都不发**——面板上就是那句
+"only available for subscription plans"。
 所以占位凭证写成文件 `~/.ccgw/claude-home/.credentials.json`，自己把 scopes 定全：
 
 ```json

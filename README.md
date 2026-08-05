@@ -184,9 +184,11 @@ ccgw -p "写个快排"                      # 参数原样透传
 
 ```bash
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
-unset ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN
+unset ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR
 export HTTPS_PROXY=http://127.0.0.1:8788   HTTP_PROXY=http://127.0.0.1:8788
 export https_proxy=http://127.0.0.1:8788   http_proxy=http://127.0.0.1:8788
+# 本机地址必须排除,否则本地跑的 MCP server / dev server 也会被绕去网关
+export NO_PROXY=localhost,127.0.0.1,::1    no_proxy=localhost,127.0.0.1,::1
 export NODE_EXTRA_CA_CERTS=$HOME/.ccgw/ccgw_ca.crt
 export CLAUDE_CONFIG_DIR=$HOME/.ccgw/claude-home
 exec claude "$@"
