@@ -28,6 +28,13 @@ PLACEHOLDER_TOKEN=${PLACEHOLDER_TOKEN:-sk-ant-oat01-placeholder}
 # 占位凭证声明的订阅档位。只影响 /usage 面板显示哪几条限额条,不影响能否取到数据。
 SUBSCRIPTION_TYPE=${SUBSCRIPTION_TYPE:-max}
 
+# 隧道保活。这两个值相乘就是「链路多久不响应就判死」:默认 30×3 = 90 秒。
+# 注意保活只负责【尽早发现链路死了并退出】,它不会重连 —— ssh 退出后隧道就没了,
+# 得重跑本脚本。所以网络经常抖的环境可以把 COUNT_MAX 调大,让短暂中断熬过去
+# (前提是底层 TCP 连接还活着;休眠唤醒后通常已经死了,调多大都救不回来)。
+SSH_ALIVE_INTERVAL=${SSH_ALIVE_INTERVAL:-30}
+SSH_ALIVE_COUNT_MAX=${SSH_ALIVE_COUNT_MAX:-3}
+
 # 生成的包装命令名。不叫 claude(会和真命令递归),也不建议叫 cc —— /usr/bin/cc 是 C 编译器,
 # 抢占它会让 make/cgo/npm 原生模块全部走岔。改名用 CMD_NAME=xxx 覆盖,脚本会做冲突检测。
 CMD_NAME=${CMD_NAME:-ccgw}
@@ -122,13 +129,19 @@ if ! ssh -f -N \
   -p "$GATEWAY_SSH_PORT" -i "$KEY" \
   -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=yes \
   -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=30 \
+  -o ServerAliveInterval="$SSH_ALIVE_INTERVAL" \
+  -o ServerAliveCountMax="$SSH_ALIVE_COUNT_MAX" \
+  -o TCPKeepAlive=yes \
   -o ControlMaster=no -o ControlPath=none \
   "$DEVICE_ID@$GATEWAY_HOST" 2>/dev/null
 then
   cat >&2 <<EOF
 
 ✗ 隧道没建起来。最常见的原因是【这台设备的公钥还没在网关登记】。
+
+  (另一个可能:本地端口 $LOCAL_PROXY_PORT 被别的程序占着 —— ExitOnForwardFailure=yes
+   之下 ssh 会因为绑不上而立刻退出。用 lsof -nP -iTCP:$LOCAL_PROXY_PORT -sTCP:LISTEN
+   看一眼;是别人的服务就换个口: LOCAL_PROXY_PORT=<别的端口> $0 $DEVICE_ID)
 
   把下面这行公钥,连同设备 id "$DEVICE_ID",交给网关管理员:
 
@@ -142,6 +155,7 @@ EOF
   exit 1
 fi
 echo "== 隧道已建立: 127.0.0.1:$LOCAL_PROXY_PORT → $GATEWAY_HOST:$GATEWAY_SSH_PORT"
+echo "   保活 ${SSH_ALIVE_INTERVAL}s×${SSH_ALIVE_COUNT_MAX} —— 链路 $((SSH_ALIVE_INTERVAL * SSH_ALIVE_COUNT_MAX))s 不响应即判死并退出(不会自动重连,重跑本脚本)"
 
 # ④ 经【已认证的隧道】自取 CA 证书。发普通 HTTP:SSH 已经认证并加密了这一跳,
 #    所以拿到的 CA 是可信的,不需要任何带外分发,也不需要登录网关机。

@@ -281,8 +281,26 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
 
 ### 隧道断了怎么办
 
-隧道是一个后台 `ssh -f -N` 进程，带 `ServerAliveInterval=30` 保活。网络切换、休眠唤醒、
-网关重启都可能让它断掉。**重跑脚本即可**，密钥和登记都会复用：
+隧道是一个后台 `ssh -f -N` 进程。**它会自己退出，而且不会自动重连**——这一点值得说清楚，
+否则很容易以为是进程"莫名挂掉"：
+
+保活参数是 `ServerAliveInterval=30` 配 `ServerAliveCountMax=3`，也就是每 30 秒探一次、
+连续 3 次没回应（合计 90 秒）就判定链路已死。ssh 手册对这个组合的说法是
+「if the server becomes unresponsive, ssh will disconnect」——**保活的职责是尽早发现链路死了
+并退出，不是把它救回来**。ssh 一退，本地端口就没了，直到你再跑一次脚本。建隧道成功时脚本会把
+这个时长打出来，方便对照。
+
+所以下面这些日常动作都足以让隧道消失：合盖休眠后唤醒（TCP 连接在恢复时通常已经死了）、
+WiFi 切换、VPN 开关、网关重启，以及任何超过 90 秒的网络中断。
+
+网络经常抖的环境可以把判死时间调长，让短暂中断熬过去——前提是底层 TCP 连接还活着，
+休眠唤醒之后调多大都救不回来：
+
+```bash
+SSH_ALIVE_INTERVAL=20 SSH_ALIVE_COUNT_MAX=6 ./scripts/setup-device.sh laptop-1   # 120 秒才判死
+```
+
+断了之后**重跑脚本即可**，密钥和登记都会复用：
 
 ```bash
 GATEWAY_HOST=gateway.example.com \
@@ -354,6 +372,8 @@ curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || \
 | `LOCAL_PROXY_PORT` | `8788` | 本机代理入口端口，`HTTPS_PROXY` 指向它 |
 | `PERMIT_TCP` | `127.0.0.1:8788` | 隧道右端目标，须与网关 `permit_targets` 一致 |
 | `REAL_CLAUDE_HOME` | `~/.claude` | 从哪儿把设置/记忆/历史链过来 |
+| `SSH_ALIVE_INTERVAL` | `30` | 隧道保活探测间隔（秒） |
+| `SSH_ALIVE_COUNT_MAX` | `3` | 连续几次探测无响应就判链路已死。两值相乘＝判死用时，默认 90 秒 |
 
 `ccgw` 内部**替你设好**的（你不用管，列出来只为让你知道发生了什么）：
 
@@ -436,7 +456,15 @@ rm ~/.ccgw/known_hosts
 
 ### 端口 8788 被本机别的程序占了
 
-换一个：`LOCAL_PROXY_PORT=18788 ./scripts/setup-device.sh laptop-1`。改的只是本机这一端，
+**症状会伪装成别的问题**：脚本用了 `ExitOnForwardFailure=yes`，端口绑不上 ssh 就立刻退出，
+于是报的是「隧道没建起来，最常见的原因是公钥还没登记」——公钥其实好好的。先确认一下谁占着：
+
+```bash
+lsof -nP -iTCP:8788 -sTCP:LISTEN
+```
+
+是自己的僵死隧道就 `pkill -f 'ssh.*ccgw_'` 清掉；是别人的服务就换一个端口：
+`LOCAL_PROXY_PORT=18788 ./scripts/setup-device.sh laptop-1`。改的只是本机这一端，
 隧道右端（`PERMIT_TCP`）不用动，包装命令会跟着一起重建。
 
 ### `⚠ PATH 里已存在同名命令 ccgw -> /usr/bin/ccgw`
