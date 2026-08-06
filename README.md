@@ -117,19 +117,17 @@ ssh:                      # 唯一对外入口;设备台账的单一数据源
 | scopes | 只有 `user:inference` | 含 `user:profile` |
 | 设备上 `/usage` | ✗ 上游 403 | ✓ 有数据 |
 | 有效期 | 长期,网关不管 | 约 8 小时;网关默认自己续(见下节) |
+| 自刷新 | 恒关(没有 refreshToken) | 默认开,含回退那条 |
 
 **网关从不写凭证文件** —— 自刷新也是 fork `claude auth login` 让客户端去写(见下节)。
-它还会按 mtime 热重载(巡检周期 30 秒),所以外部换掉凭证也能跟上;指向**本机 claude
-正在用的**那份凭证时,客户端自己刷新后网关也自动跟上(那种用法要把 `refresh` 关掉,
-否则两边会互相轮换掉对方的 refresh token)。
+它还会按 mtime 热重载(巡检周期 30 秒),所以别人换掉凭证网关也跟得上。
 
 上游返回 401 或 scope 不足的 403 时,日志里会补一句根因,不用再顺着 `request_id` 猜。
 
 ### 让上游凭证一直是新的
 
-access token TTL 是 **8 小时**,refresh token 约 **30 天**。配了 `upstream.credentials`
-时网关**默认自己续命**,不需要外部 cron;回退到本机 `~/.claude/.credentials.json` 那条路
-默认不续(见下面的三态开关)。
+access token TTL 是 **8 小时**,refresh token 约 **30 天**。凭证文件形态下网关
+**默认自己续命**,不需要外部 cron。
 
 **做法**:剩余不足 30 分钟时,fork 一个 `claude auth login`,靠客户端官方的
 **非交互 refresh-token 登录**路径(埋点 `tengu_login_from_refresh_token`)换一份新凭证,
@@ -158,9 +156,13 @@ fork 一次(单飞)。两条路径对「等」的容忍度不同:401 之后**阻
 子进程 20 秒超时。最小间隔那道是必需的 —— 账号被吊销时刷新会一直「成功」而 401 不消失,
 只靠退避的话每个 401 都会 fork 一次,而刷新又立即作废上一个 token,自我强化成进程风暴。
 
-> **`upstream.refresh` 是三态开关**:不配则按来源取默认 —— 显式 `credentials`【开】
-> (那份凭证是网关专属的,没别人会替它续命)、回退到本机 `~/.claude/.credentials.json`
-> 【关】(那份归本机 claude 管,网关去刷会轮换掉它的 refresh token)、静态 token 恒关。
+> **`upstream.refresh` 是三态开关**:不配 = 开,凭证文件形态一律如此,**包括回退到本机
+> `~/.claude/.credentials.json` 那条** —— access token 只活 8 小时,不自刷新就是每 8 小时
+> 静默断一次,而「网关正好跑在一台有人天天用 claude 的机器上」并不成立。静态 token 恒关
+> (没有 `refreshToken` 可用)。显式 `true`/`false` 一律照办。
+>
+> 和本机 claude 共用那份凭证是安全的:刷新走的就是 claude 自己那套(fork `auth login`),
+> 写回同一个文件,客户端会重读。轮换只废掉内存里那份旧的,拿它的一方重读即可恢复。
 >
 > 默认开出来的自刷新是**尽力而为**:找不到 `claude`、凭证里没有 `refreshToken`,都只告警降级、
 > 不拦启动。显式配 `refresh: true` 则是**说到做到**:同样的情况直接启动失败 ——

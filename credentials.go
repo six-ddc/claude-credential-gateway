@@ -128,12 +128,13 @@ func defaultCredentialsPath() string {
 // 两个都显式配了【直接失败】—— 它们之间没有优先级关系。凭证来源必须唯一且明确,
 // 静默择一只会让「我明明改了配置却没生效」变成一次线上排查。
 //
-// refresh 是三态开关(nil = 没配,按来源取默认):
+// refresh 是三态开关(nil = 没配,取默认):凭证文件形态一律默认【开】,
+// 包括回退到 ~/.claude/.credentials.json 那条 —— access token 只活 8 小时,不自刷新
+// 就是每 8 小时静默断一次,而「网关正好跑在一台有人天天用 claude 的机器上」并不成立。
+// 静态 token 恒关,它没有 refreshToken 可用。
 //
-//   - 显式 credentials → 默认【开】。那份凭证是网关专属的,没别人会替它续命。
-//   - 回退到 ~/.claude/.credentials.json → 默认【关】。那是本机 claude 在用的,
-//     刷新会轮换它的 refresh token;续命的活儿本来就归它自己。
-//   - 静态 token → 恒关,没有 refreshToken 可用。
+// 和本机 claude 共用那份凭证是安全的:刷新走的就是 claude 自己那套(fork auth login),
+// 写回同一个文件,客户端会重读。轮换只废掉内存里那份旧的,拿它的一方重读即可恢复。
 //
 // 默认开出来的自刷新是「尽力而为」:缺 refreshToken、找不到 claude 都只告警降级,不拦启动。
 // 显式配 true 则是「说到做到」:同样的情况直接启动失败 —— 你明说要它,它就不该悄悄不干活。
@@ -170,14 +171,7 @@ func newTokenSource(static, path string, refresh *bool, claudeBin string) (*toke
 		log.Printf("⚠ 未配置 upstream.oauth / upstream.credentials,回退到本机凭证 %s", path)
 	}
 
-	autoRefresh := !fallback // 显式 credentials 默认开,回退默认关
-	if refresh != nil {
-		autoRefresh = *refresh
-	}
-	if autoRefresh && fallback {
-		log.Printf("⚠ 对回退凭证 %s 开了自刷新:它是本机 claude 在用的那份,"+
-			"刷新会轮换 refresh token,本机 claude 可能被顶掉", path)
-	}
+	autoRefresh := refresh == nil || *refresh
 	if autoRefresh {
 		if err := ts.enableRefresh(claudeBin); err != nil {
 			if explicit {

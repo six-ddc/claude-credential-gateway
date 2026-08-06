@@ -266,9 +266,10 @@ func TestRefreshDefaultsOnForExplicitCredentials(t *testing.T) {
 	}
 }
 
-// 回退到本机 claude 的凭证时默认【关】:那份的主人是本机 claude,续命本来就归它,
-// 网关去刷会轮换掉它的 refresh token。
-func TestRefreshDefaultsOffForFallbackCredentials(t *testing.T) {
+// 回退到本机 ~/.claude/.credentials.json 时【同样】默认开。
+// access token 只活 8 小时,不自刷新就是每 8 小时静默断一次;而「网关正好跑在一台
+// 有人天天用 claude 的机器上」并不成立,不能拿它当续命方案。
+func TestRefreshDefaultsOnForFallbackCredentials(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	if err := os.Mkdir(filepath.Join(home, ".claude"), 0o700); err != nil {
@@ -276,13 +277,25 @@ func TestRefreshDefaultsOffForFallbackCredentials(t *testing.T) {
 	}
 	writeCreds(t, filepath.Join(home, ".claude", ".credentials.json"),
 		"sk-ant-oat01-home", time.Now().Add(time.Hour), "user:profile")
+	bin := fakeClaude(t, "sk-ant-oat01-new", filepath.Join(t.TempDir(), "calls.txt"), 0)
 
-	ts, err := newTokenSource("", "", nil, "")
+	ts, err := newTokenSource("", "", nil, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ts.refreshEnabled() {
+		t.Fatal("回退到本机凭证时自刷新也应当默认开启")
+	}
+}
+
+// 静态 token 恒关:它没有 refreshToken,刷不了。
+func TestRefreshOffForStaticToken(t *testing.T) {
+	ts, err := newTokenSource("sk-ant-oat01-static", "", nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ts.refreshEnabled() {
-		t.Fatal("回退到本机凭证时自刷新必须默认关闭")
+		t.Fatal("静态 token 没有 refreshToken,不该启用自刷新")
 	}
 }
 

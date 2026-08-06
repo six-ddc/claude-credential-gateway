@@ -16,8 +16,7 @@ upstream:
   oauth: ""
   # credentials:交互式 /login 写出的凭证文件。scopes 含 user:profile,/usage 才有数据。
   #   网关【从不写】这个文件:自刷新也是 fork `claude auth login` 让客户端去写。
-  #   它还会按 mtime 热重载,所以指向本机 claude 正在用的那份凭证时,
-  #   客户端自己刷新后网关也能跟上(那种用法下要把下面的 refresh 关掉)。
+  #   它还会按 mtime 热重载,所以别人换掉凭证网关也跟得上。
   #   也可用环境变量 CLAUDE_GATEWAY_UPSTREAM_CREDENTIALS 注入。
   credentials: ""
   #
@@ -25,9 +24,10 @@ upstream:
 
   # 自刷新:剩余有效期不足 30 分钟时,网关 fork 一个 `claude auth login` 把凭证续上
   # (子进程负责写回和 refresh token 的轮换持久化,网关永远不写凭证文件)。
-  # 不配则按来源取默认:显式 credentials → 开;回退到本机凭证 → 关(那份归本机 claude 管,
-  # 网关去刷会轮换掉它的 refresh token);静态 token → 恒关。显式 true/false 一律照办。
-  # refresh: true
+  # 不配 = 开:凭证文件形态一律如此,含回退到 ~/.claude/.credentials.json 那条 ——
+  # access token 只活 8 小时,不自刷新就是每 8 小时静默断一次。静态 token 恒关
+  # (没有 refreshToken 可用)。显式 true/false 一律照办。
+  # refresh: false
   # 刷新用哪个 claude;留空就是裸 "claude" 走 PATH(claude 自更新换了路径也不受影响)。
   claude_bin: ""
 
