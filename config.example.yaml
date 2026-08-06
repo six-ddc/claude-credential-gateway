@@ -6,9 +6,30 @@
 
 upstream:
   base: https://api.anthropic.com
-  # 真凭证:你订阅的 access token(以 Authorization: Bearer 注入)。
-  # 留空则用环境变量 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入。
+
+  # 真凭证:你订阅的 access token(以 Authorization: Bearer 注入)。下面两项【只能配一个】,
+  # 都配则启动直接失败 —— 凭证来源必须唯一,静默择一只会让「改了却没生效」变成一次排查。
+  #
+  # oauth:静态 token(claude setup-token 签的那种)。没有过期信息,网关也不管它的死活。
+  #   注意它的 scopes 只有 user:inference:推理正常,但设备上 /usage 和 /api/oauth/*
+  #   会被上游 403。留空则用环境变量 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入。
   oauth: ""
+  # credentials:交互式 /login 写出的凭证文件。scopes 含 user:profile,/usage 才有数据。
+  #   网关【从不写】这个文件:自刷新也是 fork `claude auth login` 让客户端去写。
+  #   它还会按 mtime 热重载,所以指向本机 claude 正在用的那份凭证时,
+  #   客户端自己刷新后网关也能跟上(那种用法下要把下面的 refresh 关掉)。
+  #   也可用环境变量 CLAUDE_GATEWAY_UPSTREAM_CREDENTIALS 注入。
+  credentials: ""
+  #
+  # 两个都留空 → 回退到本机 ~/.claude/.credentials.json(启动日志会明说这次用的是哪一份)。
+
+  # 自刷新:剩余有效期不足 30 分钟时,网关 fork 一个 `claude auth login` 把凭证续上
+  # (子进程负责写回和 refresh token 的轮换持久化,网关永远不写凭证文件)。
+  # 不配则按来源取默认:显式 credentials → 开;回退到本机凭证 → 关(那份归本机 claude 管,
+  # 网关去刷会轮换掉它的 refresh token);静态 token → 恒关。显式 true/false 一律照办。
+  # refresh: true
+  # 刷新用哪个 claude;留空就是裸 "claude" 走 PATH(claude 自更新换了路径也不受影响)。
+  claude_bin: ""
 
 # 代理的主机名单(哪个域名解密注入真凭证、哪些只做盲转发)写死在代码里,不是配置项 ——
 # 「真凭证送给谁」和「设备能出到哪儿」都不该是部署时随手改的东西。见 proxy.go 顶部,

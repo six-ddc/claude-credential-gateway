@@ -28,8 +28,18 @@ type SSHConfig struct {
 // 网关不监听任何 HTTP 端口:转发 channel 在进程内直连 HTTP handler,故没有 host/port 配置。
 type Config struct {
 	Upstream struct {
-		Base  string `yaml:"base"`
-		OAuth string `yaml:"oauth"` // 你订阅的真 access token
+		Base string `yaml:"base"`
+		// 真凭证,二选一(都配则启动失败):
+		OAuth string `yaml:"oauth"` // 静态 access token(setup-token 那种,无过期信息)
+		// 凭证文件路径(真登录写出的 .credentials.json);两个都留空则回退
+		// 到本机 ~/.claude/.credentials.json。
+		Credentials string `yaml:"credentials"`
+		// 由网关自己给凭证续命(fork `claude auth login`,见 refresh.go)。
+		// 三态:不配 → 按来源取默认(显式 credentials 开、回退到本机凭证关、静态 token 关);
+		// 显式 true/false → 照办。
+		Refresh *bool `yaml:"refresh"`
+		// 刷新用哪个 claude 可执行文件;留空则用裸 "claude" 走 PATH。
+		ClaudeBin string `yaml:"claude_bin"`
 	} `yaml:"upstream"`
 	SSH SSHConfig `yaml:"ssh"`
 }
@@ -79,6 +89,16 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("CLAUDE_GATEWAY_UPSTREAM_OAUTH"); v != "" {
 		c.Upstream.OAuth = v
+	}
+	if v := os.Getenv("CLAUDE_GATEWAY_UPSTREAM_CREDENTIALS"); v != "" {
+		c.Upstream.Credentials = v
+	}
+	if v := os.Getenv("CLAUDE_GATEWAY_UPSTREAM_REFRESH"); v != "" {
+		on := v == "1" || strings.EqualFold(v, "true")
+		c.Upstream.Refresh = &on
+	}
+	if v := os.Getenv("CLAUDE_GATEWAY_CLAUDE_BIN"); v != "" {
+		c.Upstream.ClaudeBin = v
 	}
 	if v := os.Getenv("GATEWAY_SSH_ADDR"); v != "" {
 		c.SSH.Addr = v

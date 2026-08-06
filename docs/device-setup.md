@@ -518,7 +518,7 @@ cat ~/.ccgw/claude-home/.credentials.json          # scopes 应含 user:profile
 ### 想确认额度是不是真的走了网关
 
 `curl -s http://127.0.0.1:8788/status` 看网关侧采样到的 5h/7d 快照，和 `ccgw` 里 `/usage`
-显示的对一下。网关那边还会给每个请求打一行 `[usage] user=<你的设备 id> ...`，找管理员一看便知。
+显示的对一下。网关那边还会给每个请求打一行 `msg=usage user=<你的设备 id> ...`，找管理员一看便知。
 
 ---
 

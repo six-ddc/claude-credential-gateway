@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -129,13 +131,16 @@ func TestConnectDeniedResponseIsActionable(t *testing.T) {
 // setGatewayGlobals 把 handle() 依赖的那几个包级变量指到测试实例上,并在收尾时还原。
 func setGatewayGlobals(t *testing.T, upstreamBase string) {
 	t.Helper()
-	prevCfg, prevURL, prevClient := cfg, upstreamURL, httpClient
-	t.Cleanup(func() { cfg, upstreamURL, httpClient = prevCfg, prevURL, prevClient })
+	prevCfg, prevURL, prevClient, prevTokens := cfg, upstreamURL, httpClient, tokens
+	t.Cleanup(func() {
+		cfg, upstreamURL, httpClient, tokens = prevCfg, prevURL, prevClient, prevTokens
+	})
 
 	c := &Config{}
 	c.Upstream.Base = upstreamBase
 	c.Upstream.OAuth = testRealToken
 	cfg = c
+	tokens = &tokenSource{token: testRealToken}
 
 	u, err := url.Parse(upstreamBase)
 	if err != nil {
@@ -230,6 +235,129 @@ func TestProxyForwardsNonV1Path(t *testing.T) {
 	body, _ := io.ReadAll(res.Body)
 	if len(body) == 0 {
 		t.Fatal("响应体应透传回客户端")
+	}
+}
+
+// upstreamAuthRecorder 造一个只认某一个 token 的假上游,并记下每次收到的 Authorization。
+func upstreamAuthRecorder(t *testing.T, wantToken string) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("authorization")
+		mu.Lock()
+		seen = append(seen, auth)
+		mu.Unlock()
+		if wantToken == "" || auth != "Bearer "+wantToken {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"type":"error","error":{"type":"authentication_error","message":"Invalid authentication"}}`)
+			return
+		}
+		w.Header().Set("content-type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), seen...)
+	}
+}
+
+// fileBackedTokens 让网关用一份盘上的凭证文件,并返回改写它的钩子(模拟外部刷新)。
+func fileBackedTokens(t *testing.T, token string) (string, func(string)) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), ".credentials.json")
+	write := func(tok string) {
+		writeCreds(t, path, tok, time.Now().Add(8*time.Hour), "user:inference", "user:profile")
+	}
+	write(token)
+	return path, write
+}
+
+// 外部刷新会【立即】作废旧的 access token(实测:旧 token 当场 401),网关手里那份当场变废纸。
+// 所以 401 之后必须立刻重读凭证、用新 token 重放,否则每次刷新都要黑掉一整个巡检周期。
+func TestProxyRetriesAfterCredentialRefresh(t *testing.T) {
+	up, seen := upstreamAuthRecorder(t, "sk-ant-oat01-new")
+
+	credPath, rewrite := fileBackedTokens(t, "sk-ant-oat01-old")
+	ts, err := newTokenSource("", credPath, boolPtr(false), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signer, pub := genClientKey(t)
+	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
+	addr := listen(t, s)
+	setGatewayGlobals(t, up.URL)
+	tokens = ts // setGatewayGlobals 的 cleanup 会还原
+	serveGatewayHTTP(t, s)
+
+	// 模拟 cron 刚刚刷新过:盘上已经是新 token,网关内存里还是旧的。
+	rewrite("sk-ant-oat01-new")
+
+	sshc, err := dialSSH(addr, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sshc.Close()
+
+	req, _ := http.NewRequest("POST", "https://"+forgedHost+"/v1/messages", strings.NewReader(`{"model":"claude-haiku-4-5-20251001"}`))
+	req.Header.Set("authorization", "Bearer sk-ant-oat01-placeholder")
+	res, err := proxyClient(t, sshc, readFile(t, s.ca.certPath)).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		t.Fatalf("401 后应当用新凭证重放并成功,实际状态 %d", res.StatusCode)
+	}
+	got := seen()
+	if len(got) != 2 {
+		t.Fatalf("上游应当被打两次(旧的一次 + 重放一次),实际 %d 次: %v", len(got), got)
+	}
+	if got[0] != "Bearer sk-ant-oat01-old" || got[1] != "Bearer sk-ant-oat01-new" {
+		t.Fatalf("第一次该用旧 token、重放该用新 token,实际 %v", got)
+	}
+}
+
+// 凭证是真废了(文件没变)的时候不能重放:否则每个请求都翻倍打到上游。
+func TestProxyDoesNotRetryWhenCredentialUnchanged(t *testing.T) {
+	up, seen := upstreamAuthRecorder(t, "") // 一律 401
+
+	credPath, _ := fileBackedTokens(t, "sk-ant-oat01-dead")
+	ts, err := newTokenSource("", credPath, boolPtr(false), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signer, pub := genClientKey(t)
+	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
+	addr := listen(t, s)
+	setGatewayGlobals(t, up.URL)
+	tokens = ts
+	serveGatewayHTTP(t, s)
+
+	sshc, err := dialSSH(addr, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sshc.Close()
+
+	req, _ := http.NewRequest("GET", "https://"+forgedHost+"/api/oauth/usage", nil)
+	req.Header.Set("authorization", "Bearer sk-ant-oat01-placeholder")
+	res, err := proxyClient(t, sshc, readFile(t, s.ca.certPath)).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 401 {
+		t.Fatalf("凭证真废了就该把 401 透传回去,实际 %d", res.StatusCode)
+	}
+	if got := seen(); len(got) != 1 {
+		t.Fatalf("凭证没变就不该重放,上游应当只被打一次,实际 %d 次: %v", len(got), got)
 	}
 }
 

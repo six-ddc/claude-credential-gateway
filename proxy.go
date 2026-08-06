@@ -130,8 +130,7 @@ func (s *sshServer) handleConnect(c net.Conn, br *bufio.Reader, req *http.Reques
 	mitm := isMITMHost(hostname)
 	if !mitm && !hostInList(tunnelHosts, hostname) {
 		writeConnectDenied(c, hostname)
-		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "connect_host",
-			"user": device, "host": hostname})
+		events.Warn("connect denied", "reason", "host_not_allowed", "user", device, "host", hostname)
 		return
 	}
 
@@ -144,15 +143,13 @@ func (s *sshServer) handleConnect(c net.Conn, br *bufio.Reader, req *http.Reques
 	client := replayBuffered(c, br)
 
 	if mitm {
-		audit(map[string]any{"ts": nowMs(), "ok": true, "event": "connect_mitm",
-			"user": device, "host": target})
+		events.Info("connect", "mode", "mitm", "user", device, "host", target)
 		// 握手本身留给 HTTP Server 的连接 goroutine 做。
 		s.pushTunnel(tls.Server(client, s.tlsConf))
 		return
 	}
 
-	audit(map[string]any{"ts": nowMs(), "ok": true, "event": "connect_tunnel",
-		"user": device, "host": target})
+	events.Info("connect", "mode", "tunnel", "user", device, "host", target)
 	relay(client, withPort(target, "443"))
 }
 

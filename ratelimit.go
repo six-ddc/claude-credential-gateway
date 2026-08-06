@@ -11,7 +11,6 @@ package main
 //	聚合:                       anthropic-ratelimit-unified-status / -reset
 
 import (
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,22 +65,26 @@ func sampleRateLimit(h http.Header) *RateWindow {
 	return w
 }
 
-// logRateLimit 把采样到的额度打成日志;status 非 allowed 时升级为醒目告警。
+// logRateLimit 把采样到的额度打成事件日志;status 非 allowed 时升级级别,
+// 好让「快撞限额了」在满屏 INFO 里自己跳出来,也便于采集器按 level 告警。
 func logRateLimit(w *RateWindow) {
 	if w == nil {
 		return
 	}
-	msg := "[ratelimit] 5h=" + pct(w.Util5h) + resetHint(" reset5h=", w.Reset5h) +
-		" 7d=" + pct(w.Util7d) + resetHint(" reset7d=", w.Reset7d)
+	attrs := []any{
+		"5h", pct(w.Util5h), "reset5h", resetAt(w.Reset5h),
+		"7d", pct(w.Util7d), "reset7d", resetAt(w.Reset7d),
+		"status", w.Status5h,
+	}
 	switch w.Status5h {
 	case "", "allowed":
-		log.Printf("%s", msg)
+		events.Info("ratelimit", attrs...)
 	case "allowed_warning":
-		log.Printf("⚠ %s status=allowed_warning(接近 5h 限额)", msg)
+		events.Warn("ratelimit 接近 5h 限额", attrs...)
 	case "rejected":
-		log.Printf("🛑 %s status=rejected(5h 限额已耗尽)", msg)
+		events.Error("ratelimit 5h 限额已耗尽", attrs...)
 	default:
-		log.Printf("%s status=%s", msg, w.Status5h)
+		events.Warn("ratelimit", attrs...)
 	}
 }
 
@@ -123,10 +126,10 @@ func pct(f float64) string {
 	return strconv.FormatFloat(f*100, 'f', 0, 64) + "%"
 }
 
-// resetHint 在重置时间有效时返回 " 前缀=HH:MM",否则空串。
-func resetHint(prefix string, t time.Time) string {
+// resetAt 渲染重置时刻;没采样到就返回空串,由 nonEmpty 把整个字段略掉。
+func resetAt(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	return prefix + t.Local().Format("15:04")
+	return t.Local().Format("15:04")
 }

@@ -81,7 +81,8 @@ cp config.example.yaml config.yaml        # config.yaml 已在 .gitignore,改它
 ```yaml
 upstream:
   base: https://api.anthropic.com
-  oauth: ""               # 你订阅的真 access token;留空则用 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入
+  oauth: ""               # 静态 access token(setup-token 那种);留空则用 CLAUDE_GATEWAY_UPSTREAM_OAUTH 注入
+  credentials: ""         # 或指一份 .credentials.json;两个都留空 → 回退 ~/.claude/.credentials.json
 ssh:                      # 唯一对外入口;设备台账的单一数据源
   addr: ":2222"                       # 唯一对外端口
   host_key: ./ssh_host_ed25519_key    # 服务端私钥;不存在则首启自动生成
@@ -97,8 +98,85 @@ ssh:                      # 唯一对外入口;设备台账的单一数据源
 配置路径优先级:`GATEWAY_CONFIG` 指定 > 本地 `config.yaml` > `config.example.yaml`(模板,并提示拷贝)。
 
 可用环境变量覆盖:`GATEWAY_UPSTREAM_BASE`、`CLAUDE_GATEWAY_UPSTREAM_OAUTH`、
-`GATEWAY_SSH_ADDR`、`GATEWAY_SSH_HOST_KEY`、`GATEWAY_SSH_CA_KEY`、
-`GATEWAY_SSH_PERMIT_TARGETS`(逗号分隔)、`GATEWAY_SSH_AUTHORIZED_KEYS`(JSON `[{id,key}]`)。
+`CLAUDE_GATEWAY_UPSTREAM_CREDENTIALS`、`CLAUDE_GATEWAY_UPSTREAM_REFRESH`、
+`CLAUDE_GATEWAY_CLAUDE_BIN`、`GATEWAY_SSH_ADDR`、`GATEWAY_SSH_HOST_KEY`、
+`GATEWAY_SSH_CA_KEY`、`GATEWAY_SSH_PERMIT_TARGETS`(逗号分隔)、
+`GATEWAY_SSH_AUTHORIZED_KEYS`(JSON `[{id,key}]`)。
+
+日志还有一个:`GATEWAY_LOG_FORMAT=json` 把事件日志切成 JSON(给采集器)。见「日志」。
+
+### 上游凭证从哪来
+
+`oauth` 和 `credentials` **只能配一个**,都配则启动直接失败 —— 凭证来源必须唯一,静默择一
+只会让「我明明改了配置却没生效」变成一次线上排查。两个都留空则回退到本机
+`~/.claude/.credentials.json`(启动日志会明说这次用的是哪一份,回退不是隐形的)。
+
+| | `oauth`(静态 token) | `credentials`(凭证文件) |
+|---|---|---|
+| 来源 | `claude setup-token` | 交互式 `/login` 写出的 `.credentials.json` |
+| scopes | 只有 `user:inference` | 含 `user:profile` |
+| 设备上 `/usage` | ✗ 上游 403 | ✓ 有数据 |
+| 有效期 | 长期,网关不管 | 约 8 小时;网关默认自己续(见下节) |
+
+**网关从不写凭证文件** —— 自刷新也是 fork `claude auth login` 让客户端去写(见下节)。
+它还会按 mtime 热重载(巡检周期 30 秒),所以外部换掉凭证也能跟上;指向**本机 claude
+正在用的**那份凭证时,客户端自己刷新后网关也自动跟上(那种用法要把 `refresh` 关掉,
+否则两边会互相轮换掉对方的 refresh token)。
+
+上游返回 401 或 scope 不足的 403 时,日志里会补一句根因,不用再顺着 `request_id` 猜。
+
+### 让上游凭证一直是新的
+
+access token TTL 是 **8 小时**,refresh token 约 **30 天**。配了 `upstream.credentials`
+时网关**默认自己续命**,不需要外部 cron;回退到本机 `~/.claude/.credentials.json` 那条路
+默认不续(见下面的三态开关)。
+
+**做法**:剩余不足 30 分钟时,fork 一个 `claude auth login`,靠客户端官方的
+**非交互 refresh-token 登录**路径(埋点 `tengu_login_from_refresh_token`)换一份新凭证,
+2 秒出结果,不起会话、不开浏览器、不跑推理、不加载 hooks。网关传给子进程的是:
+
+```
+CLAUDE_CONFIG_DIR=<凭证所在目录>      决定新凭证写回哪里
+CLAUDE_CODE_OAUTH_REFRESH_TOKEN=…    每次都从文件重读(它会轮换,不能缓存)
+CLAUDE_CODE_OAUTH_SCOPES=…           客户端要求与签发时一致,缺了直接报错
+IS_SANDBOX=1                          没有 tty,不设会卡在交互提示上
+```
+
+环境是**显式构造**的,不继承网关进程 —— 继承下来 `HTTPS_PROXY` 会让子进程绕回网关自己
+(自指环路),`ANTHROPIC_API_KEY` 会让客户端走别的鉴权分支,刷了个寂寞。
+
+**为什么外包给 claude 而不是自己发 OAuth 请求**:刷新协议(端点、client_id、字段)是未公开的,
+自己实现哪天会静默炸掉;交给客户端则升级 claude 就跟上了。写回和轮换持久化也一并外包 ——
+网关永远不写凭证文件,**唯一不可逆的风险(写坏它就得重新登录)直接消失**。
+
+**刷新是临界区。** 刷新会【立即】作废旧的 access token,不是等它自然过期,所以并发请求只
+fork 一次(单飞)。两条路径对「等」的容忍度不同:401 之后**阻塞等**(手里那份确定是废的);
+到期前的例行检查**等不到就走**(手里那份还够用几十分钟,后台巡检本来就会去刷,
+不该把一次刷新的耗时摊给所有并发请求)。
+
+三道闸门防止刷新失控:失败按 30s→5min 指数退避;**不论成败**都有 1 分钟的最小间隔;
+子进程 20 秒超时。最小间隔那道是必需的 —— 账号被吊销时刷新会一直「成功」而 401 不消失,
+只靠退避的话每个 401 都会 fork 一次,而刷新又立即作废上一个 token,自我强化成进程风暴。
+
+> **`upstream.refresh` 是三态开关**:不配则按来源取默认 —— 显式 `credentials`【开】
+> (那份凭证是网关专属的,没别人会替它续命)、回退到本机 `~/.claude/.credentials.json`
+> 【关】(那份归本机 claude 管,网关去刷会轮换掉它的 refresh token)、静态 token 恒关。
+>
+> 默认开出来的自刷新是**尽力而为**:找不到 `claude`、凭证里没有 `refreshToken`,都只告警降级、
+> 不拦启动。显式配 `refresh: true` 则是**说到做到**:同样的情况直接启动失败 ——
+> 你明说要它,它就不该悄悄不干活。
+
+> **两条兜底**:后台每 30 秒按 mtime 热重载(凭证被外部换掉也能跟上);上游一返回 401
+> 就立刻刷新/重读并**用新 token 重放这次请求**。凭证没变就不重放,不会把上游请求量翻倍。
+>
+> **`refreshTokenExpiresAt` 不会因刷新而延长**,它锚定在最初那次交互式登录上。
+> **约 30 天是硬死线,刷得再勤也躲不过**,到点必须有人去重新 `claude /login`。
+> 网关会在剩 7d / 3d / 1d 时各告警一次。
+
+> **占位凭证会被拒绝启动。** 设备侧那份假凭证(`~/.ccgw/claude-home/.credentials.json`,
+> `sk-ant-oat01-placeholder`)长得跟真凭证一模一样 —— scopes 齐全、`expiresAt` 在 2100 年,
+> 混进上游凭证的位置会让每个请求都 401,而启动日志一片祥和。宁可起不来。
+> 凭证里没有 `refreshToken` 时也会告警:那种凭证到期即死,没人能给它续命。
 
 > `host_key` 与 `ca_key` 都是**私钥**,已 gitignore、权限 0600。生产上建议把它们放到仓库之外
 > (如 `/etc/ccgw/`),免得被 `git clean` 之类的操作误删。
@@ -160,8 +238,14 @@ ssh:                      # 唯一对外入口;设备台账的单一数据源
 ### ① 网关机(你信任的常驻机)
 
 ```bash
-export CLAUDE_GATEWAY_UPSTREAM_OAUTH='<你的订阅 access token>'
+# 网关机上先 claude /login 登录你的订阅账号,凭证就位后直接跑 ——
+# 不配任何凭证时网关回退读 ~/.claude/.credentials.json(scopes 含 user:profile,/usage 才有数据)
 ./claude-credential-gateway
+
+# 或者显式指一份网关专属凭证(推荐:自刷新默认开)
+export CLAUDE_GATEWAY_UPSTREAM_CREDENTIALS=/var/lib/claude-gateway/.credentials.json
+# —— 二选一,不能同时配 —— 静态 token(setup-token,scopes 只有 inference)
+# export CLAUDE_GATEWAY_UPSTREAM_OAUTH='<你的订阅 access token>'
 ```
 
 首次启动会自动生成 SSH host key 与 TLS 终结 CA,并在日志里打印 host key 指纹。
@@ -359,17 +443,31 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
 
 之后再跑 `ccgw`,就能直接用、不再要求登录账号。
 
-## Token 用量日志
+## 日志
 
-每个成功请求,网关都会打印一行(从**上游响应**解析):
+日志分两类,故意用两套写法:
+
+- **启动横幅**:给人读一次的中文说明,走 `log`,不带前缀和时间戳。它是「文档」不是「数据」。
+- **事件日志**:每个请求/连接一条,走 `log/slog`。要被 grep、被眼睛快速扫、必要时被采集器吃掉。
 
 ```
-[usage] user=laptop-1 model=claude-opus-4-8 input=1234 output=567 cache_create=0 cache_read=8900 total=10701
+time=23:38:27 level=INFO msg=connect mode=mitm user=laptop-1 host=api.anthropic.com:443
+time=23:38:27 level=INFO msg=request user=laptop-1 method=GET  path=/api/oauth/usage status=200 dur=1ms
+time=23:38:27 level=INFO msg=request user=laptop-1 method=POST path=/v1/messages model=claude-opus-4-8 status=200 dur=2.1s
+time=23:38:29 level=INFO msg=usage user=laptop-1 model=claude-opus-4-8 input=1234 output=567 cache_create=0 cache_read=8900 total=10701
+time=23:38:29 level=INFO msg=ratelimit 5h=37% reset5h=15:59 7d=12%
 ```
 
-`user` 是 SSH 公钥认定的 device id(伪造不了)。其余字段对应 Anthropic API 的 `usage`:
+`user` 是 SSH 公钥认定的 device id(伪造不了)。`usage` 各字段对应 Anthropic API 的 `usage`:
 `input` = `input_tokens`,`output` = `output_tokens`(流式取最后一个 `message_delta` 的累计值),
 `cache_create` / `cache_read` 为缓存写/读 token。
+
+`GATEWAY_LOG_FORMAT=json` 切成 JSON 给采集器。限额接近/耗尽会自动升到 `WARN`/`ERROR`,
+便于按 level 告警。
+
+> **`model` 为空是正常的**,而且占了大头 —— `model` 取自**请求体**,只有 `/v1/messages`
+> 这类推理请求才有;`/api/oauth/usage` 这些 GET 根本没有 body。空字段直接不打,
+> 想知道是哪个端点看 `path`。
 
 > 网关不做任何配额/限流;用量仅打印,不拦截。
 
@@ -378,11 +476,15 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
 设备上直接用 `/usage`:它打的是 `GET /api/oauth/usage`(客户端走全局 axios 的端点),代理把这条
 也送进隧道,网关按 path 原样转给上游并注入真凭证 —— 于是设备看到的是**你订阅账号的真实额度**。
 
-两个前提缺一不可,`ccgw` 都替你处理好了:
+三个前提缺一不可,前两个 `ccgw` 都替你处理好了,第三个在网关侧:
 
 - 占位凭证的 scopes 含 `user:profile`。少了它客户端**连请求都不发**,面板显示
   "only available for subscription plans";
-- 环境里没有 `CLAUDE_CODE_OAUTH_TOKEN`。设了它就走 env token 分支,scopes 退回 inference-only。
+- 环境里没有 `CLAUDE_CODE_OAUTH_TOKEN`。设了它就走 env token 分支,scopes 退回 inference-only;
+- **网关注入的真凭证 scopes 也要含 `user:profile`。** 客户端肯发了,上游还得认 ——
+  用 `claude setup-token` 签的静态 token 只有 `user:inference`,上游会回
+  `403 OAuth token does not meet scope requirement`(推理照常,只有账号类端点受影响)。
+  改用 `upstream.credentials` 指一份真登录的凭证即可,见「上游凭证从哪来」。
 
 不进客户端也能看:`curl http://127.0.0.1:8788/status` 给的是网关**被动采样**的 5h/7d 限额快照
 (从上游响应头取,零额外请求),还没转发过任何请求时返回 `{}`。

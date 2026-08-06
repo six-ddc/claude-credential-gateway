@@ -360,9 +360,8 @@ func newSSHServer(sc SSHConfig, reloadPath string) (*sshServer, error) {
 			if id, ok := auth.lookup(key); ok {
 				return &ssh.Permissions{Extensions: map[string]string{"device": id}}, nil
 			}
-			audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "ssh_auth",
-				"user": meta.User(), "addr": meta.RemoteAddr().String(),
-				"fingerprint": ssh.FingerprintSHA256(key)})
+			events.Warn("ssh auth rejected", "user", meta.User(),
+				"addr", meta.RemoteAddr().String(), "fingerprint", ssh.FingerprintSHA256(key))
 			return nil, fmt.Errorf("unknown public key for %q", meta.User())
 		},
 	}
@@ -404,8 +403,7 @@ func (s *sshServer) handleConn(nc net.Conn) {
 	}
 	defer sc.Close()
 	device := sc.Permissions.Extensions["device"]
-	audit(map[string]any{"ts": nowMs(), "ok": true, "event": "ssh_connect",
-		"user": device, "addr": sc.RemoteAddr().String()})
+	events.Info("ssh connect", "user", device, "addr", sc.RemoteAddr().String())
 
 	// 连接级请求(tcpip-forward 等)全拒 → 禁 -R 反向转发。
 	go ssh.DiscardRequests(reqs)
@@ -452,8 +450,7 @@ func (s *sshServer) handleConn(nc net.Conn) {
 }
 
 func (s *sshServer) rejectTarget(newCh ssh.NewChannel, device, target string) {
-	audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "ssh_target",
-		"user": device, "target": target})
+	events.Warn("ssh forward denied", "reason", "target_not_permitted", "user", device, "target", target)
 	newCh.Reject(ssh.Prohibited, "target not permitted")
 }
 
@@ -466,8 +463,7 @@ func (s *sshServer) acceptForward(newCh ssh.NewChannel, sc *ssh.ServerConn, devi
 	}
 	// channel 级请求同样全拒。
 	go ssh.DiscardRequests(chReqs)
-	audit(map[string]any{"ts": nowMs(), "ok": true, "event": "ssh_forward",
-		"user": device, "target": target})
+	events.Info("ssh forward", "user", device, "target", target)
 	conn := &channelConn{Channel: ch, addr: tunnelAddr{device: device, remote: sc.RemoteAddr().String()}}
 	// 嗅探要等客户端先说话,放到独立 goroutine,别卡住这条 SSH 连接的 channel 分发循环。
 	go s.serveTunnelConn(conn, device)

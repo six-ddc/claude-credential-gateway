@@ -38,8 +38,14 @@ var (
 	cfg         *Config
 	upstreamURL *url.URL
 	httpClient  *http.Client
-	caCertPEM   []byte // TLS 终结 CA 的证书,经 /ca 发给已认证的设备
+	caCertPEM   []byte       // TLS 终结 CA 的证书,经 /ca 发给已认证的设备
+	tokens      *tokenSource // 注入用的订阅凭证,见 credentials.go
 )
+
+// credentialsCheckInterval 是凭证文件的巡检周期:热重载 + 到期告警都挂在它上面。
+// 换凭证最迟一个周期生效 —— 手动换 token 或本机 claude 刷新都够快了,
+// 换成每请求 stat 只会白白给热路径加系统调用。
+const credentialsCheckInterval = 30 * time.Second
 
 // 逐跳头(hop-by-hop)与不应透传的头,在透明转发时剥掉。
 // 注:Authorization 会在注入真凭证时被整个覆盖,无需在此单独剥离。
@@ -59,7 +65,7 @@ var stripHeaders = map[string]bool{
 }
 
 func main() {
-	log.SetFlags(0) // 输出干净,不加时间戳前缀
+	log.SetFlags(0) // 启动横幅走 log,输出干净、不加时间戳前缀(事件日志走 slog,见 logging.go)
 
 	c, path, err := loadConfig()
 	if err != nil {
@@ -67,8 +73,10 @@ func main() {
 	}
 	cfg = c
 
-	if cfg.Upstream.OAuth == "" {
-		log.Fatal("✗ 需要订阅 access token(CLAUDE_GATEWAY_UPSTREAM_OAUTH 或 config.yaml 的 upstream.oauth)")
+	tokens, err = newTokenSource(cfg.Upstream.OAuth, cfg.Upstream.Credentials,
+		cfg.Upstream.Refresh, cfg.Upstream.ClaudeBin)
+	if err != nil {
+		log.Fatalf("✗ %v", err)
 	}
 
 	u, err := url.Parse(cfg.Upstream.Base)
@@ -81,8 +89,11 @@ func main() {
 		Transport: &http.Transport{
 			DisableCompression: true, // 不自动解压:逐字节透传给客户端,attestation/编码头不变
 			Proxy:              http.ProxyFromEnvironment,
+			// 只约束「多久之内要给出响应头」,不约束响应体的长度 ——
+			// 上游挂死时不至于把 handler 永久挂住,而 SSE 开始流之后想跑多久跑多久。
+			ResponseHeaderTimeout: 2 * time.Minute,
 		},
-		// 不设全局超时:SSE 流式可能很长
+		// 刻意不设 Client.Timeout:那会连 SSE 流式响应一起掐掉。
 	}
 
 	reloadPath := path
@@ -110,12 +121,21 @@ func main() {
 	// 名单写死在代码里,启动时打出来,免得要翻源码才知道放行了谁。
 	log.Printf("代理: 解密注入 %s", forgedHost)
 	log.Printf("代理: 盲转发 %s", strings.Join(tunnelHosts, ", "))
-	log.Printf("注入: 订阅 OAuth token (len=%d)", len(cfg.Upstream.OAuth))
+	log.Printf("注入: %s", tokens.describe())
+	tokens.logCredentialNotes()
+	tokens.checkExpiry() // 启动时就先报一次:剩余有效期已经很紧的话,现在就该知道
 	ids := make([]string, 0, len(cfg.SSH.AuthorizedKeys))
 	for _, ak := range cfg.SSH.AuthorizedKeys {
 		ids = append(ids, ak.ID)
 	}
 	log.Printf("可信设备: %s", strings.Join(ids, ", "))
+
+	// 凭证巡检:热重载 + 主动刷新 + 到期告警。静态 token 没文件可盯,省掉这个 goroutine。
+	// 判据用 tokens.path 而不是配置项 —— 「是不是文件凭证」newTokenSource 已经定过一次了,
+	// 再从配置反推等于把同一个不变量拆到两个文件里。
+	if tokens.path != "" {
+		go tokens.watch(credentialsCheckInterval)
+	}
 
 	// 转发 channel 直接进 HTTP Server,全程不监听任何本机 HTTP 端口。
 	go func() { log.Fatalf("✗ 隧道 HTTP 退出: %v", srv.Serve(sshSrv.tunnels)) }()
@@ -123,6 +143,9 @@ func main() {
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	retried := false // 401 之后换新凭证重放过一次,见 5b
+
 	// 1) 身份来自连接本身:SSH 层公钥认证出的 device id(ConnContext 写入)。
 	//    客户端 Authorization 里的占位 token 不参与鉴权,随后会被真凭证整个覆盖。
 	device := deviceFrom(r.Context())
@@ -130,7 +153,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// 唯一入口是 SSH 隧道,所以一切请求都必须带设备身份。
 	if device == "" {
 		writeError(w, 403, "ssh tunnel required")
-		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "no_tunnel", "path": r.URL.Path})
+		events.Warn("rejected", "reason", "no_tunnel", "path", r.URL.Path)
 		return
 	}
 
@@ -163,8 +186,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	if r.URL.IsAbs() && !isMITMHost(hostnameOf(r.URL.Host)) {
 		if !hostInList(tunnelHosts, hostnameOf(r.URL.Host)) {
 			writeError(w, 403, "host not permitted: "+r.URL.Host)
-			audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "proxy_host",
-				"user": device, "host": r.URL.Host})
+			events.Warn("rejected", "reason", "host_not_allowed", "user", device, "host", r.URL.Host)
 			return
 		}
 		inject = false
@@ -187,32 +209,69 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		target = r.URL.String()
 	}
 
-	// 4) 构造上游请求 —— 该注入的注入,客户端的凭证企图一律剥掉
-	upReq, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
-	if err != nil {
-		writeError(w, 502, "build upstream request failed")
-		return
+	// 4) 发一次上游请求。抽成闭包是为了 401 之后能用新 token 原样重放 ——
+	//    两次必须完全一致,只差 Authorization。带上 r.Context():客户端断开时
+	//    上游请求跟着取消,否则 handler 会一直读到上游自己结束,goroutine 白挂着。
+	send := func(token string) (*http.Response, error) {
+		upReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		// 透明转发:保留客户端(真 Claude Code)拼好的所有头(betas/版本/UA/attestation 在 body)。
+		copyHeaders(upReq.Header, r.Header)
+		if inject {
+			// 只换 Host + Authorization(占位 → 真订阅 token)
+			upReq.Host = upstreamURL.Host
+			upReq.Header.Set("authorization", "Bearer "+token)
+		}
+		return httpClient.Do(upReq)
 	}
 
-	// 透明转发:保留客户端(真 Claude Code)拼好的所有头(betas/版本/UA/attestation 在 body)。
-	copyHeaders(upReq.Header, r.Header)
+	sent := ""
 	if inject {
-		// 只换 Host + Authorization(占位 → 真订阅 token)
-		upReq.Host = upstreamURL.Host
-		upReq.Header.Set("authorization", "Bearer "+cfg.Upstream.OAuth)
+		// 到期前主动刷一次。自刷新没开时是 no-op;开着且已有人在刷时不陪等 ——
+		// 手里这份还够用几十分钟,真废了有下面的 401 兜底。
+		tokens.ensureFresh("")
+		sent = tokens.get()
 	}
 
-	// 5) 转发到上游
-	upRes, err := httpClient.Do(upReq)
+	upRes, err := send(sent)
 	if err != nil {
 		writeError(w, 502, "upstream error: "+err.Error())
-		audit(map[string]any{"ts": nowMs(), "ok": false, "reason": "upstream", "user": device, "err": err.Error()})
+		events.Error("upstream failed", "user", device, "path", r.URL.Path, "err", err)
 		return
+	}
+
+	// 5) 401 兜底。刷新凭证会【立即】作废旧的 access token(实测:旧 token 当场 401),
+	// 所以刷新那一刻,网关手里的 token 就废了。干等后台巡检那一轮 = 一个周期的全量 401,
+	// 太贵。这里立刻换一份新的(自刷新开着就刷,只读模式就从盘上重读),确实变了才重放 ——
+	// 凭证是真死了的话拿到的还是同一个,于是不重放,不会把上游请求量翻倍。
+	// body 早就读进内存了,重放不花额外代价;此时响应头都还没往客户端写,SSE 也不受影响。
+	if inject && upRes.StatusCode == 401 {
+		if fresh := tokens.recoverFrom401(sent); fresh != "" && fresh != sent {
+			upRes.Body.Close()
+			retried = true
+			if upRes, err = send(fresh); err != nil {
+				writeError(w, 502, "upstream error: "+err.Error())
+				events.Error("upstream failed", "user", device, "path", r.URL.Path, "err", err)
+				return
+			}
+		}
 	}
 	defer upRes.Body.Close()
 
 	status := upRes.StatusCode
-	audit(map[string]any{"ts": nowMs(), "ok": true, "user": device, "model": reqModel, "status": status})
+	// path 是这条日志里最值钱的字段:上游 4xx 时,「哪个端点被拒了」直接决定往哪儿查
+	// (账号类端点 403 和推理 403 是两回事)。以前这条只记 model,出事只能顺着 request_id 猜。
+	attrs := []any{
+		"user", device, "method", r.Method, "path", r.URL.Path, "model", reqModel,
+		"status", status, "dur", time.Since(start).Round(time.Millisecond),
+	}
+	if retried {
+		// 只在真发生过时才打:绝大多数请求没重放过,retried=false 每行都占位纯属噪音。
+		attrs = append(attrs, "retried", true)
+	}
+	events.Info("request", attrs...)
 
 	// 被动采样订阅限额(5h/7d):Anthropic 的每个响应都带这些头,零额外请求。
 	// 盲转发出去的第三方响应不看 —— 那些头要么没有,要么含义不同。
@@ -239,6 +298,19 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			text = text[:2000]
 		}
 		log.Printf("[upstream %d] %s", status, text)
+		if inject {
+			// 这两类错都在说「凭证不对」而不是「请求不对」,直接把话挑明,
+			// 省得下次又要顺着 request_id 去猜。
+			if status == 401 {
+				if hint := tokens.expiryHint(); hint != "" {
+					log.Printf("  ↑ 401: %s", hint)
+				}
+			}
+			if status == 403 && strings.Contains(text, "scope requirement") {
+				log.Printf("  ↑ 403: 上游凭证的 scope 不够(多半缺 user:profile)。" +
+					"推理不受影响,受影响的是 /usage 与 /api/oauth/* 这类账号端点")
+			}
+		}
 		return
 	}
 	// token 用量只从 Anthropic 的响应解析:第三方 JSON 里恰好有 model/usage 字段的话,
@@ -352,19 +424,6 @@ func extractUsage(text, contentType string) *Usage {
 	}
 }
 
-func logUsage(device, reqModel string, u *Usage) {
-	model := u.Model
-	if model == "" {
-		model = reqModel
-	}
-	if model == "" {
-		model = "?"
-	}
-	total := u.Input + u.Output + u.CacheCreate + u.CacheRead
-	log.Printf("[usage] user=%s model=%s input=%d output=%d cache_create=%d cache_read=%d total=%d",
-		device, model, u.Input, u.Output, u.CacheCreate, u.CacheRead, total)
-}
-
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		if stripHeaders[strings.ToLower(k)] {
@@ -394,10 +453,3 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	b, _ := json.Marshal(map[string]string{"error": msg})
 	w.Write(b)
 }
-
-func audit(e map[string]any) {
-	b, _ := json.Marshal(e)
-	log.Printf("[audit] %s", b)
-}
-
-func nowMs() int64 { return time.Now().UnixMilli() }

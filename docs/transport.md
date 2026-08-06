@@ -183,7 +183,7 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
 
 所以 CONNECT 在 `serveTunnelConn`(`sshfwd.go:212`)里就地读、就地应答,压根不进 `http.Server`。
 `main.go` 的 handler 里留了一道兜底:真收到 CONNECT 就回 501 明说「这应该在隧道层处理掉」
-(`main.go:138-141`),分派逻辑漏了要吵出来,而不是默默当普通请求转出去。
+(`main.go:162-164`),分派逻辑漏了要吵出来,而不是默默当普通请求转出去。
 
 ---
 
@@ -205,7 +205,7 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
 
 ### 5.2 CONNECT 之后按名单二选一
 
-`handleConnect`(`proxy.go:121-155`)拿 CONNECT 的目标主机名比两份名单:
+`handleConnect`(`proxy.go:123-154`)拿 CONNECT 的目标主机名比两份名单:
 
 - 命中注入主机(`isMITMHost`,`proxy.go:64`)→ 回 200,就地 TLS 终结,解密出的请求塞回 HTTP
   Server,走正常的注入 + 转发;
@@ -235,8 +235,8 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
   很宽的出口;而官方写明它被挡时会回落到 `api.anthropic.com`,代价只是 `/plugin` 里看不到安装数
   与插件元数据。
 
-网关启动时把两份名单各打一行(`main.go:111-112`),不用翻源码就知道放行了谁。被拦的 CONNECT 回的
-是带缘由的 403(`writeConnectDenied`,`proxy.go:160-167`):body 是 JSON,带被拒的主机名和该往
+网关启动时把两份名单各打一行(`main.go:122-123`),不用翻源码就知道放行了谁。被拦的 CONNECT 回的
+是带缘由的 403(`writeConnectDenied`,`proxy.go:159-166`):body 是 JSON,带被拒的主机名和该往
 盲转发名单里加的提示。客户端那头只看得到代理的状态码,不这么写排查时只剩一个光秃秃的 403。
 
 ### 5.3 注入与透传
@@ -245,12 +245,12 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
 
 - **身份来自连接本身**。SSH 层公钥认证出的 device id 由 `ConnContext` 写进每个请求的 context;
   客户端 `Authorization` 里的占位 token 不参与鉴权,随后被整个覆盖成真订阅 token。
-- **上游 path 原样透传**(`main.go:183-185`)。客户端要打哪个端点就转哪个 —— 这是 `/usage` 能工作的前提之一。
+- **上游 path 原样透传**(`main.go:205-207`)。客户端要打哪个端点就转哪个 —— 这是 `/usage` 能工作的前提之一。
   路径一旦被改写,客户端拿到的报错就跟它请求的端点毫无关系,极难排查。
-- **剥掉客户端的凭证企图**(`main.go:46-59`)。`x-api-key` 必剥:设备上残留的 `ANTHROPIC_API_KEY` 会让
+- **剥掉客户端的凭证企图**(`main.go:52-65`)。`x-api-key` 必剥:设备上残留的 `ANTHROPIC_API_KEY` 会让
   客户端改发这个头,它优先级高于 `Authorization`,不剥就是上游拿假 key 校验后 401。
   `proxy-authorization` 也剥 —— 那是客户端发给**代理**的,不该转给上游。
-- **明文 HTTP 按同样两份名单分流**(`main.go:163-172`)。经代理的明文请求是绝对形式
+- **明文 HTTP 按同样两份名单分流**(`main.go:180-193`)。经代理的明文请求是绝对形式
   (`GET http://host/path`):`api.anthropic.com` 换上游并注入真凭证;命中盲转发名单的原样转过去且
   **不注入**(WebFetch 抓 http 站点靠这条);都不命中才 403。真凭证只进 `api.anthropic.com`。
   不注入的那条同时也不采样限额、不记 token 用量 —— 第三方响应里的同名字段不是那个意思。
@@ -353,5 +353,5 @@ scopes 是字面量写死的(`utils/auth.ts:1266`),keychain 和凭证文件都�
 | CONNECT 分流、盲转发 | `proxy.go`(`handleConnect` 在 `121`) |
 | 首字节分派、deadline no-op 与 Hijack 陷阱 | `sshfwd.go:182-184`、`201-241` |
 | TLS 终结、自建 CA、伪造叶证书 | `tlsterm.go`(`forgedHost` 在 `44`) |
-| 凭证注入、剥头、path 透传 | `main.go:46-59`、`124-202` |
-| 两份写死的主机名单(注入 / 盲转发) | `proxy.go:29-64`(启动时打印在 `main.go:110-112`) |
+| 凭证注入、剥头、path 透传 | `main.go:52-65`、`145-323` |
+| 两份写死的主机名单(注入 / 盲转发) | `proxy.go:29-64`(启动时打印在 `main.go:122-123`) |
