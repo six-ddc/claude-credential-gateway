@@ -82,8 +82,9 @@ type tokenSource struct {
 	// path 与 claudeBin 都是构造期一次性写入、goroutine 起来之前就定死的,
 	// 所以 refreshEnabled()/runRefresh() 在锁外读它们不构成竞争。
 	// 【将来若加「运行时改凭证来源」的路径,这两个必须一起纳入 mu。】
-	path  string // 空 → 静态 token,不重载
-	mtime time.Time
+	path     string // 空 → 静态 token,不重载
+	mtime    time.Time
+	lastStat time.Time // 上次去看 mtime 的时刻,见 statThrottle
 
 	token        string
 	refreshToken string // 只传给 claude 子进程用于刷新,网关自己不拿它发请求
@@ -274,12 +275,39 @@ func (t *tokenSource) reloadNow() string {
 	return t.get()
 }
 
-// get 返回当前注入用的 token。这是每个请求都要走的热路径,只加一次锁、不碰文件系统 ——
-// 文件变更交给后台 watch 循环发现。
+// statThrottle 限制 get() 去看文件的频率。
+//
+// 别人(本机 claude、cron、手动换)带外刷新凭证后,光靠后台巡检最长要 30 秒才发现,
+// 那段时间里的请求会拿废 token 出门 —— 虽然 401 兜底会重放救回来,但那是一次白跑的
+// 上游往返。每请求都 stat 又太实在:一秒节流足够把窗口压到 1 秒,而正常流量下
+// 每秒最多一个 stat(还是命中 inode 缓存的那种),等于白送。
+const statThrottle = time.Second
+
+// get 返回当前注入用的 token。热路径:绝大多数调用只加一次锁就返回,
+// 至多每秒才会去看一眼文件有没有被别人换掉(见 statThrottle)。
 func (t *tokenSource) get() string {
+	t.maybeReloadThrottled()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.token
+}
+
+// maybeReloadThrottled 是 get() 用的节流版 maybeReload:一秒内只让一个调用去 stat,
+// 其余直接返回。lastStat 在【发起前】就记上,所以失败也照样节流,不会把
+// 「文件读不到」放大成每请求一条告警。
+func (t *tokenSource) maybeReloadThrottled() {
+	if t.path == "" {
+		return // 静态 token 没文件可看
+	}
+	t.mu.Lock()
+	due := time.Since(t.lastStat) >= statThrottle
+	if due {
+		t.lastStat = time.Now()
+	}
+	t.mu.Unlock()
+	if due {
+		t.maybeReload()
+	}
 }
 
 // maybeReload 在凭证文件 mtime 变化时热重载。任何失败都只告警不中断:

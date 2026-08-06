@@ -165,6 +165,59 @@ func TestTokenSourceReloadsOnMtimeChange(t *testing.T) {
 	}
 }
 
+// get() 会自己发现别人带外换掉的凭证,但带一秒节流:热路径不该每次都 stat。
+// 这两半是一组契约,得一起钉住 —— 只测「能发现」会让节流被悄悄改没,
+// 只测「有节流」又可能把「永远不发现」当成通过。
+func TestTokenSourceGetPicksUpExternalChangeThrottled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".credentials.json")
+	writeCreds(t, path, "sk-ant-oat01-old", time.Now().Add(8*time.Hour), "user:profile")
+
+	ts, err := newTokenSource("", path, boolPtr(false), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ts.get(); got != "sk-ant-oat01-old" {
+		t.Fatalf("token = %q", got)
+	}
+
+	// 别人(本机 claude / cron / 手动)换掉了凭证。
+	writeCreds(t, path, "sk-ant-oat01-external", time.Now().Add(8*time.Hour), "user:profile")
+	future := time.Now().Add(time.Minute)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	// 上一次 stat 就在刚才,节流窗口内不该再去看文件。
+	if got := ts.get(); got != "sk-ant-oat01-old" {
+		t.Fatalf("节流窗口内不该重复 stat,token 应还是旧的,实际 %q", got)
+	}
+
+	// 窗口过去之后,不需要任何人推一把,get() 自己就能发现。
+	ts.mu.Lock()
+	ts.lastStat = time.Now().Add(-2 * statThrottle)
+	ts.mu.Unlock()
+
+	if got := ts.get(); got != "sk-ant-oat01-external" {
+		t.Fatalf("节流窗口过后 get() 应当自动读到新凭证,实际 %q", got)
+	}
+}
+
+// 静态 token 没有文件,节流路径必须是彻底的 no-op(别去 stat 一个空路径)。
+func TestTokenSourceGetNoStatForStaticToken(t *testing.T) {
+	ts, err := newTokenSource("sk-ant-oat01-static", "", boolPtr(false), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if got := ts.get(); got != "sk-ant-oat01-static" {
+			t.Fatalf("token = %q", got)
+		}
+	}
+	if !ts.lastStat.IsZero() {
+		t.Fatal("静态 token 不该去看文件,lastStat 应当没被动过")
+	}
+}
+
 // 重载失败要沿用旧 token:手里那份在过期前仍然能用,断服务比用着旧凭证更糟。
 func TestTokenSourceKeepsOldTokenWhenReloadFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".credentials.json")

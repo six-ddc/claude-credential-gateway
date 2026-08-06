@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 const testRealToken = "sk-ant-oat01-REAL-UPSTREAM"
@@ -275,8 +277,45 @@ func fileBackedTokens(t *testing.T, token string) (string, func(string)) {
 	return path, write
 }
 
-// 外部刷新会【立即】作废旧的 access token(实测:旧 token 当场 401),网关手里那份当场变废纸。
-// 所以 401 之后必须立刻重读凭证、用新 token 重放,否则每次刷新都要黑掉一整个巡检周期。
+// 别人带外换掉凭证后,get() 的节流 stat 会在【发请求之前】就发现,连那次注定 401 的
+// 上游往返都省了。这是最常见的路径 —— 只要两次请求间隔超过 statThrottle。
+func TestProxyPicksUpExternalRefreshBeforeSending(t *testing.T) {
+	up, seen := upstreamAuthRecorder(t, "sk-ant-oat01-new")
+
+	credPath, rewrite := fileBackedTokens(t, "sk-ant-oat01-old")
+	ts, err := newTokenSource("", credPath, boolPtr(false), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signer, pub := genClientKey(t)
+	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
+	addr := listen(t, s)
+	setGatewayGlobals(t, up.URL)
+	tokens = ts
+	serveGatewayHTTP(t, s)
+
+	rewrite("sk-ant-oat01-new") // 模拟本机 claude / cron 刚刷过
+
+	sshc, err := dialSSH(addr, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sshc.Close()
+
+	res := proxyGet(t, sshc, s, "/api/oauth/usage")
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("应当直接用新凭证成功,实际状态 %d", res.StatusCode)
+	}
+	if got := seen(); len(got) != 1 || got[0] != "Bearer sk-ant-oat01-new" {
+		t.Fatalf("上游只该被打一次、且用的是新 token,实际 %v", got)
+	}
+}
+
+// 凭证在 get() 之后才被换掉(或者恰好落在节流窗口里)时,靠 401 兜底:
+// 刷新会【立即】作废旧的 access token,网关手里那份当场变废纸,必须重读并用新 token 重放,
+// 否则每次带外刷新都要黑掉一整个巡检周期。
 func TestProxyRetriesAfterCredentialRefresh(t *testing.T) {
 	up, seen := upstreamAuthRecorder(t, "sk-ant-oat01-new")
 
@@ -290,11 +329,15 @@ func TestProxyRetriesAfterCredentialRefresh(t *testing.T) {
 	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
 	addr := listen(t, s)
 	setGatewayGlobals(t, up.URL)
-	tokens = ts // setGatewayGlobals 的 cleanup 会还原
+	tokens = ts
 	serveGatewayHTTP(t, s)
 
-	// 模拟 cron 刚刚刷新过:盘上已经是新 token,网关内存里还是旧的。
 	rewrite("sk-ant-oat01-new")
+	// 把节流窗口按住,模拟「凭证正好在 get() 之后才变」—— 这样才测得到 401 那条路,
+	// 而不是被 get() 的预检顺手救掉。
+	ts.mu.Lock()
+	ts.lastStat = time.Now()
+	ts.mu.Unlock()
 
 	sshc, err := dialSSH(addr, signer)
 	if err != nil {
@@ -302,14 +345,8 @@ func TestProxyRetriesAfterCredentialRefresh(t *testing.T) {
 	}
 	defer sshc.Close()
 
-	req, _ := http.NewRequest("POST", "https://"+forgedHost+"/v1/messages", strings.NewReader(`{"model":"claude-haiku-4-5-20251001"}`))
-	req.Header.Set("authorization", "Bearer sk-ant-oat01-placeholder")
-	res, err := proxyClient(t, sshc, readFile(t, s.ca.certPath)).Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	res := proxyGet(t, sshc, s, "/api/oauth/usage")
 	defer res.Body.Close()
-
 	if res.StatusCode != 200 {
 		t.Fatalf("401 后应当用新凭证重放并成功,实际状态 %d", res.StatusCode)
 	}
@@ -320,6 +357,18 @@ func TestProxyRetriesAfterCredentialRefresh(t *testing.T) {
 	if got[0] != "Bearer sk-ant-oat01-old" || got[1] != "Bearer sk-ant-oat01-new" {
 		t.Fatalf("第一次该用旧 token、重放该用新 token,实际 %v", got)
 	}
+}
+
+// proxyGet 经隧道发一个注入路径上的 GET。
+func proxyGet(t *testing.T, sshc *ssh.Client, s *sshServer, path string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("GET", "https://"+forgedHost+path, nil)
+	req.Header.Set("authorization", "Bearer sk-ant-oat01-placeholder")
+	res, err := proxyClient(t, sshc, readFile(t, s.ca.certPath)).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
 }
 
 // 凭证是真废了(文件没变)的时候不能重放:否则每个请求都翻倍打到上游。
