@@ -246,7 +246,8 @@ func (t *tokenSource) reload() error {
 	t.mu.Unlock()
 
 	if noisy {
-		log.Printf("⚠ 凭证文件 %s 权限是 %#o,同机其他用户可读;建议 chmod 600", t.path, perm)
+		events.Warn("凭证文件权限过宽,同机其他用户可读;建议 chmod 600",
+			"path", t.path, "perm", fmt.Sprintf("%#o", perm))
 	}
 	return nil
 }
@@ -269,7 +270,7 @@ func (t *tokenSource) reloadNow() string {
 		return ""
 	}
 	if err := t.reload(); err != nil {
-		log.Printf("⚠ 401 后重载凭证文件 %s 失败: %v(沿用旧 token)", t.path, err)
+		events.Warn("401 后重载凭证失败,沿用旧 token", "path", t.path, "err", err)
 		return ""
 	}
 	return t.get()
@@ -318,7 +319,7 @@ func (t *tokenSource) maybeReload() {
 	}
 	info, err := os.Stat(t.path)
 	if err != nil {
-		log.Printf("⚠ 读取凭证文件 %s 失败: %v(沿用旧 token)", t.path, err)
+		events.Warn("读取凭证文件失败,沿用旧 token", "path", t.path, "err", err)
 		return
 	}
 	t.mu.Lock()
@@ -328,10 +329,10 @@ func (t *tokenSource) maybeReload() {
 		return
 	}
 	if err := t.reload(); err != nil {
-		log.Printf("⚠ 重载凭证文件 %s 失败: %v(沿用旧 token)", t.path, err)
+		events.Warn("重载凭证文件失败,沿用旧 token", "path", t.path, "err", err)
 		return
 	}
-	log.Printf("已重载上游凭证: %s", t.describe())
+	events.Info("已重载上游凭证", "detail", t.describe())
 }
 
 // checkExpiry 按阶梯打到期告警 —— 提醒人来处理的通道。
@@ -348,23 +349,22 @@ func (t *tokenSource) checkExpiry() {
 	if !t.refreshEnabled() {
 		if within, hit := t.accessExpiry.newlyCrossed(); hit {
 			if within == 0 {
-				log.Printf("✗ 上游凭证已于 %s 过期:上游会开始返回 401。网关不自动刷新,请更换 %s",
-					t.accessExpiry.at.Format(time.DateTime), t.path)
+				events.Error("上游凭证已过期,上游会开始返回 401。网关不自动刷新,请更换凭证",
+					"expired_at", t.accessExpiry.at.Format(time.DateTime), "path", t.path)
 			} else {
-				log.Printf("⚠ 上游凭证剩余有效期不足 %s(%s 到期)。网关不自动刷新,请及时更换 %s",
-					humanDur(within), t.accessExpiry.at.Format(time.DateTime), t.path)
+				events.Warn("上游凭证快过期了。网关不自动刷新,请及时更换凭证",
+					"within", humanDur(within), "expires_at", t.accessExpiry.at.Format(time.DateTime), "path", t.path)
 			}
 		}
 	}
 
 	if within, hit := t.refreshExpiry.newlyCrossed(); hit {
 		if within == 0 {
-			log.Printf("✗ refresh token 已于 %s 过期:自动刷新救不回来了,"+
-				"必须重新 claude /login 并更新 %s", t.refreshExpiry.at.Format(time.DateTime), t.path)
+			events.Error("refresh token 已过期,自动刷新救不回来了,必须重新 claude /login",
+				"expired_at", t.refreshExpiry.at.Format(time.DateTime), "path", t.path)
 		} else {
-			log.Printf("⚠ refresh token 还有不到 %s 到期(%s)。它是硬死线 —— "+
-				"每次刷新都不会延长它,到点必须重新 claude /login",
-				humanDur(within), t.refreshExpiry.at.Format(time.DateTime))
+			events.Warn("refresh token 快到硬死线了。每次刷新都不会延长它,到点必须重新 claude /login",
+				"within", humanDur(within), "deadline", t.refreshExpiry.at.Format(time.DateTime))
 		}
 	}
 }

@@ -104,6 +104,12 @@ func TestRefreshRunsClaudeAndPicksUpNewToken(t *testing.T) {
 	if ts.refreshToken != "sk-ant-ort01-rotated" {
 		t.Fatalf("轮换后的 refreshToken 应当被读回,实际 %q", ts.refreshToken)
 	}
+	// 网关自己也得认为这次成了。曾经栽在这儿:token 确实换了、却被报成
+	// 「刷新后 token 没有变化」——因为成败判据里的 before 取在 fork 之后,
+	// 而 get() 的节流 stat 抢先把新凭证读了进来。只验 token 换没换是抓不到的。
+	if bo := ts.currentBackoff(); bo != 0 {
+		t.Fatalf("刷新成功不该进退避,实际 %v(说明被误判成失败了)", bo)
+	}
 }
 
 // 还早就别刷:刷新要 fork 进程、还会作废手里的 token,不能每个请求都来一遍。

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,20 +247,20 @@ func TestTokenSourceKeepsOldTokenWhenReloadFails(t *testing.T) {
 func TestTokenSourceExpiryWarnsOncePerStage(t *testing.T) {
 	ts := newAccessOnlyWatch(30 * time.Minute)
 
-	if out := captureLog(t, ts.checkExpiry); countLines(out) != 1 {
+	if out := captureEvents(t, ts.checkExpiry); countLines(out) != 1 {
 		t.Fatalf("剩余 30 分钟应当告警且只告一行,实际日志: %q", out)
 	}
-	if out := captureLog(t, ts.checkExpiry); out != "" {
+	if out := captureEvents(t, ts.checkExpiry); out != "" {
 		t.Fatalf("同一档不应重复告警,实际日志: %q", out)
 	}
 
 	// 跌到「已过期」时还要再报一次,并且此后不再重复。
 	ts.accessExpiry.at = time.Now().Add(-time.Minute)
-	out := captureLog(t, ts.checkExpiry)
+	out := captureEvents(t, ts.checkExpiry)
 	if countLines(out) != 1 || !strings.Contains(out, "过期") {
 		t.Fatalf("已过期应当再报一行,实际日志: %q", out)
 	}
-	if out := captureLog(t, ts.checkExpiry); out != "" {
+	if out := captureEvents(t, ts.checkExpiry); out != "" {
 		t.Fatalf("已过期后不应再重复告警,实际日志: %q", out)
 	}
 }
@@ -267,7 +268,7 @@ func TestTokenSourceExpiryWarnsOncePerStage(t *testing.T) {
 // 启动时就已经很紧的凭证,只报最紧那一档,不该把中间每一档都刷一遍。
 func TestTokenSourceExpiryReportsTightestStageOnly(t *testing.T) {
 	ts := newAccessOnlyWatch(5 * time.Minute) // 一次性跌破 6h / 1h / 15m 三档
-	out := captureLog(t, ts.checkExpiry)
+	out := captureEvents(t, ts.checkExpiry)
 	if countLines(out) != 1 {
 		t.Fatalf("跌破多档也只该报最紧的那一行,实际日志: %q", out)
 	}
@@ -295,13 +296,24 @@ func TestTokenSourceExpiryHint(t *testing.T) {
 	}
 }
 
-// captureLog 抓走 log 的输出供断言。到期告警要保的行为是「打了什么、打了几行」,
-// 断言内部计数器只是在重述实现。
+// captureLog 抓走 log(启动横幅那一路)的输出供断言。
 func captureLog(t *testing.T, fn func()) string {
 	t.Helper()
 	var buf strings.Builder
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
+	fn()
+	return buf.String()
+}
+
+// captureEvents 抓走 slog(运行期事件那一路)的输出供断言。
+// 到期告警要保的行为是「打了什么、打了几行」,断言内部计数器只是在重述实现。
+func captureEvents(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf strings.Builder
+	prev := events
+	events = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{ReplaceAttr: humanize}))
+	defer func() { events = prev }()
 	fn()
 	return buf.String()
 }
@@ -324,7 +336,7 @@ func TestTokenSourceWarnsRefreshTokenDeadline(t *testing.T) {
 		t.Fatal("refreshTokenExpiresAt 没有从文件里读出来(json tag 对不上?)")
 	}
 
-	out := captureLog(t, ts.checkExpiry)
+	out := captureEvents(t, ts.checkExpiry)
 	if !strings.Contains(out, "refresh token") || !strings.Contains(out, "/login") {
 		t.Fatalf("refresh token 快到期时应当提示重新登录,实际日志: %q", out)
 	}
@@ -332,7 +344,7 @@ func TestTokenSourceWarnsRefreshTokenDeadline(t *testing.T) {
 		t.Fatalf("access token 还有 7 小时,不该被这次检查带出告警,实际日志: %q", out)
 	}
 
-	if again := captureLog(t, ts.checkExpiry); strings.Contains(again, "refresh token") {
+	if again := captureEvents(t, ts.checkExpiry); strings.Contains(again, "refresh token") {
 		t.Fatalf("同一档不应重复告警,实际日志: %q", again)
 	}
 }
@@ -353,7 +365,7 @@ func TestCheckExpirySilentAboutAccessTokenWhenAutoRefreshing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out := captureLog(t, ts.checkExpiry); strings.Contains(out, "网关不自动刷新") {
+	if out := captureEvents(t, ts.checkExpiry); strings.Contains(out, "网关不自动刷新") {
 		t.Fatalf("自刷新开着时不该喊「网关不自动刷新」,实际日志: %q", out)
 	}
 
@@ -362,7 +374,7 @@ func TestCheckExpirySilentAboutAccessTokenWhenAutoRefreshing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out := captureLog(t, ro.checkExpiry); !strings.Contains(out, "网关不自动刷新") {
+	if out := captureEvents(t, ro.checkExpiry); !strings.Contains(out, "网关不自动刷新") {
 		t.Fatalf("只读模式下 access token 快过期必须告警,实际日志: %q", out)
 	}
 }

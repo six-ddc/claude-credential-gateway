@@ -461,7 +461,11 @@ time=23:38:27 level=INFO msg=request user=laptop-1 method=GET  path=/api/oauth/u
 time=23:38:27 level=INFO msg=request user=laptop-1 method=POST path=/v1/messages model=claude-opus-4-8 status=200 dur=2.1s
 time=23:38:29 level=INFO msg=usage user=laptop-1 model=claude-opus-4-8 input=1234 output=567 cache_create=0 cache_read=8900 total=10701
 time=23:38:29 level=INFO msg=ratelimit 5h=37% reset5h=15:59 7d=12%
+time=06:39:33 level=INFO msg="已刷新上游凭证" detail="订阅 OAuth token (len=108) ← …,14:39:33 到期(剩余 8h0m)"
 ```
+
+凭证的刷新/重载/到期告警也走这一路 —— 它们是**运行期事件**,需要时间戳才能和请求日志对上。
+只有启动横幅留在 `log`。
 
 `user` 是 SSH 公钥认定的 device id(伪造不了)。`usage` 各字段对应 Anthropic API 的 `usage`:
 `input` = `input_tokens`,`output` = `output_tokens`(流式取最后一个 `message_delta` 的累计值),

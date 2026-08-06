@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,16 +88,20 @@ func (t *tokenSource) ensureFresh(stale string) {
 	err := t.runRefresh()
 	backoff := t.noteRefreshDone(err)
 	if err != nil {
-		log.Printf("✗ 刷新上游凭证失败: %v(沿用旧 token,%s 后再试)", err, humanDur(backoff))
+		events.Error("刷新上游凭证失败,沿用旧 token", "err", err, "retry_in", humanDur(backoff))
 		return
 	}
-	log.Printf("已刷新上游凭证: %s", t.describe())
+	events.Info("已刷新上游凭证", "detail", t.describe())
 }
 
 // runRefresh 跑一次 `claude auth login`,成功后把盘上的新凭证读回内存。
 // 凭证由子进程写,网关只负责读 —— 轮换后的 refresh token 也就自动落盘了。
 func (t *tokenSource) runRefresh() error {
+	// before 必须在【fork 之前】取,而且要直接读字段、不能走 get()。
+	// get() 带节流 stat,子进程一落盘它自己就把新凭证读进来了 —— 那样 before 等于新 token,
+	// 成败判据当场失效,一次成功的刷新会被报成「token 没有变化」。
 	t.mu.Lock()
+	before := t.token
 	refreshTok, scopes, bin := t.refreshToken, append([]string(nil), t.scopes...), t.claudeBin
 	t.mu.Unlock()
 
@@ -137,14 +140,12 @@ func (t *tokenSource) runRefresh() error {
 	}
 
 	// 子进程已经把新凭证写回盘上了,读回来即可 —— 轮换后的 refresh token 一并到手。
-	before := t.get()
+	// (get() 的节流 stat 可能已经抢先读过了,reload 再来一次也无妨,幂等。)
 	if err := t.reload(); err != nil {
 		return fmt.Errorf("刷新后重读凭证失败: %w", err)
 	}
 	// 判据是「token 到底换没换」,不是「换完还剩多久」。上游签发的 TTL 短于 refreshMargin 时,
-	// 按剩余时间判会把一次成功的刷新记成失败 —— 而那时 token 其实已经进内存了,
-	// 于是既误退避、日志又说反话(「沿用旧 token」)。token 没变才是真出事:
-	// 子进程把凭证写去了别处。
+	// 按剩余时间判会把一次成功的刷新记成失败。token 没变才是真出事:子进程把凭证写去了别处。
 	if t.get() == before {
 		return fmt.Errorf("刷新后 token 没有变化,检查 CLAUDE_CONFIG_DIR 是不是指向了 %s 所在的目录",
 			t.path)
