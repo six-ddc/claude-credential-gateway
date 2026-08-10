@@ -27,11 +27,13 @@ func initLogging() {
 	events = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{ReplaceAttr: humanize}))
 }
 
-// humanize 是人读模式的字段改写:时间砍成时分秒,空字段整条丢掉。
-// 网关的事件都是「刚刚」发生的,完整 RFC3339 占掉半行宽度却没人会去读那个年份。
+// humanize 是人读模式的字段改写:时间砍到秒、保留日期,空字段整条丢掉。
+// 只留时分秒的话,跑上几天的日志就分不清是哪天的了 —— 事后按天统计只能靠时间回绕去猜。
+// 用 T 连接日期而不是空格,值里就没有空格,slog 不会加引号,grep/awk 直接切。
+// 完整 RFC3339 仍嫌宽:毫秒和时区对单机网关没有信息量。
 func humanize(groups []string, a slog.Attr) slog.Attr {
 	if a.Key == slog.TimeKey && len(groups) == 0 {
-		return slog.String(slog.TimeKey, a.Value.Time().Format("15:04:05"))
+		return slog.String(slog.TimeKey, a.Value.Time().Format("2006-01-02T15:04:05"))
 	}
 	return dropEmpty(groups, a)
 }
