@@ -297,20 +297,23 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		if len(text) > 2000 {
 			text = text[:2000]
 		}
-		log.Printf("[upstream %d] %s", status, text)
+		// 这两类错都在说「凭证不对」而不是「请求不对」,直接把话挑明,省得下次又要顺着
+		// request_id 去猜。hint 挂在同一条事件上而不是单独打一行:并发请求下两行会被
+		// 别的日志冲散,而「哪个 401 配哪句解释」是看的人最需要的关联。空 hint 由
+		// dropEmpty 自动丢掉,不占版面。
+		hint := ""
 		if inject {
-			// 这两类错都在说「凭证不对」而不是「请求不对」,直接把话挑明,
-			// 省得下次又要顺着 request_id 去猜。
 			if status == 401 {
-				if hint := tokens.expiryHint(); hint != "" {
-					log.Printf("  ↑ 401: %s", hint)
-				}
+				hint = tokens.expiryHint()
 			}
 			if status == 403 && strings.Contains(text, "scope requirement") {
-				log.Printf("  ↑ 403: 上游凭证的 scope 不够(多半缺 user:profile)。" +
-					"推理不受影响,受影响的是 /usage 与 /api/oauth/* 这类账号端点")
+				hint = "上游凭证的 scope 不够(多半缺 user:profile)。" +
+					"推理不受影响,受影响的是 /usage 与 /api/oauth/* 这类账号端点"
 			}
 		}
+		// body 放最后:它最长且可能带换行,排在前面会把关键字段挤出视线。
+		events.Warn("upstream error", "user", device, "path", r.URL.Path,
+			"status", status, "hint", hint, "body", text)
 		return
 	}
 	// token 用量只从 Anthropic 的响应解析:第三方 JSON 里恰好有 model/usage 字段的话,

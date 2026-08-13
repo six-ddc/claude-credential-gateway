@@ -106,22 +106,28 @@ func (a *authorizedKeys) maybeReload() {
 	}
 	data, err := os.ReadFile(a.path)
 	if err != nil {
-		log.Printf("⚠ 重载 %s 失败: %v(沿用旧公钥列表)", a.path, err)
+		a.reloadFailed("read", err)
 		return
 	}
 	var c Config
 	if err := yaml.Unmarshal(data, &c); err != nil {
-		log.Printf("⚠ 重载 %s 失败: %v(沿用旧公钥列表)", a.path, err)
+		a.reloadFailed("parse_yaml", err)
 		return
 	}
 	keys, err := parseKeyList(c.SSH.AuthorizedKeys)
 	if err != nil {
-		log.Printf("⚠ 重载 %s 失败: %v(沿用旧公钥列表)", a.path, err)
+		a.reloadFailed("parse_key", err)
 		return
 	}
 	a.keys = keys
 	a.mtime = info.ModTime()
-	log.Printf("已重载 SSH 可信公钥: %d 台设备", len(keys))
+	events.Info("ssh keys reloaded", "devices", len(keys))
+}
+
+// reloadFailed 三种失败的处置完全一样(沿用旧列表),只有原因不同,所以只在 reason 上分。
+// 注意 mtime 不推进:下次认证会再试一遍,配置改回来就能自愈,不用重启。
+func (a *authorizedKeys) reloadFailed(reason string, err error) {
+	events.Warn("ssh keys reload failed", "reason", reason, "path", a.path, "err", err)
 }
 
 // loadOrCreateHostKey 加载服务端 host key;文件不存在则自动生成 ed25519 私钥落盘(0600),

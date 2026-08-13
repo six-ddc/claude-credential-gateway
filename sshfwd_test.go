@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -439,5 +440,46 @@ func TestAuthorizedKeysHotReload(t *testing.T) {
 	}
 	if id, ok := auth.lookup(signerB.PublicKey()); !ok || id != "dev-b" {
 		t.Fatalf("dev-b 应热重载生效,got %q %v", id, ok)
+	}
+}
+
+// 公钥重载是运行期事件,必须走 slog 而不是 log:没有时间戳就没法和紧邻的
+// 「ssh auth rejected」对时序,而设备被拒时最想知道的恰恰是「列表在那之前重载了没有」。
+func TestAuthorizedKeysReloadLogsToEvents(t *testing.T) {
+	signerA, pubA := genClientKey(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+
+	// 每次都把 mtime 推到未来,确保重载判据认定「已修改」。
+	writeCfg := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		future := time.Now().Add(2 * time.Second)
+		if err := os.Chtimes(cfgPath, future, future); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCfg("ssh:\n  authorized_keys:\n    - id: dev-a\n      key: \"" + pubA[:len(pubA)-1] + "\"\n")
+
+	// 初始列表故意留空:第一次 lookup 就会触发一次重载。
+	auth, err := newAuthorizedKeys(nil, cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureEvents(t, func() { auth.lookup(signerA.PublicKey()) })
+	if !strings.Contains(out, "ssh keys reloaded") || !strings.Contains(out, "devices=1") {
+		t.Fatalf("重载成功应打一条 slog 事件,实际 %q", out)
+	}
+
+	// 配置写坏:沿用旧列表(断服务比用旧列表更糟),并按原因分类告警。
+	writeCfg("ssh:\n  authorized_keys: [ 这不是 YAML\n")
+	out = captureEvents(t, func() {
+		if _, ok := auth.lookup(signerA.PublicKey()); !ok {
+			t.Error("重载失败应沿用旧列表,dev-a 不该跟着失效")
+		}
+	})
+	if !strings.Contains(out, "ssh keys reload failed") || !strings.Contains(out, "reason=parse_yaml") {
+		t.Fatalf("YAML 坏掉应按 parse_yaml 告警,实际 %q", out)
 	}
 }

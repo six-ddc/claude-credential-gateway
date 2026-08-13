@@ -414,12 +414,9 @@ func TestTokenSourceWarnsMissingRefreshToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var buf strings.Builder
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
-	ts.logCredentialNotes()
-	if !strings.Contains(buf.String(), "refreshToken") {
-		t.Fatalf("缺 refreshToken 时应当告警,实际日志: %q", buf.String())
+	out := captureLog(t, ts.logCredentialNotes)
+	if !strings.Contains(out, "refreshToken") {
+		t.Fatalf("缺 refreshToken 时应当告警,实际日志: %q", out)
 	}
 }
 
@@ -432,11 +429,7 @@ func TestTokenSourceWarnsMissingProfileScope(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var buf strings.Builder
-		log.SetOutput(&buf)
-		defer log.SetOutput(os.Stderr)
-		ts.logCredentialNotes()
-		return buf.String()
+		return captureLog(t, ts.logCredentialNotes)
 	}
 
 	if out := capture("user:inference"); !strings.Contains(out, "user:profile") {
