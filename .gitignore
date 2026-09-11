@@ -32,7 +32,7 @@ config.*.yml
 # Go 构建产物
 /claude-credential-gateway
 *.exe
-/dist/
+/dist/   # make device-bins 的产物
 
 # 部署时的回滚副本
 *.old

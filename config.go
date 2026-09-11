@@ -21,6 +21,7 @@ type SSHConfig struct {
 	HostKey        string          `yaml:"host_key"`        // 服务端私钥路径(机密,不内联);不存在则自动生成
 	CAKey          string          `yaml:"ca_key"`          // TLS 终结 CA(机密);不存在则自动生成,另导出 <path>.crt 供设备信任
 	PermitTargets  []string        `yaml:"permit_targets"`  // 转发白名单,每项 host:port 或 unix:/path
+	DeviceBinDir   string          `yaml:"device_bin_dir"`  // 设备端二进制目录(<dir>/<os>/<arch>),经 ssh exec 分发
 	AuthorizedKeys []AuthorizedKey `yaml:"authorized_keys"` // 可信设备公钥,每台一项
 }
 
@@ -112,6 +113,9 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("GATEWAY_SSH_PERMIT_TARGETS"); v != "" {
 		c.SSH.PermitTargets = strings.Split(v, ",")
 	}
+	if v := os.Getenv("GATEWAY_SSH_DEVICE_BIN_DIR"); v != "" {
+		c.SSH.DeviceBinDir = v
+	}
 	if v := os.Getenv("GATEWAY_SSH_AUTHORIZED_KEYS"); v != "" {
 		var list []AuthorizedKey
 		if err := json.Unmarshal([]byte(v), &list); err == nil {
@@ -134,9 +138,12 @@ func (c *Config) applyDefaults() {
 		c.SSH.CAKey = "./ccgw_ca_key"
 	}
 	if len(c.SSH.PermitTargets) == 0 {
-		// 代理形态走 tcp(设备侧 -L 出一个本地端口给 HTTPS_PROXY 用);
-		// unix 目标留着兼容老设备的 ANTHROPIC_UNIX_SOCKET 形态。
-		// 网关并不真监听它们,这里只是校验客户端 -L 声明的目标,防止误以为能转发到别处。
+		// tcp 那项是设备侧分流代理开 direct-tcpip channel 时声明的目标;unix 那项是
+		// ANTHROPIC_UNIX_SOCKET 形态用的。网关并不真监听它们,只是校验声明的目标,
+		// 防止误以为能转发到别处。
 		c.SSH.PermitTargets = []string{"127.0.0.1:8788", "unix:/run/ccgw.sock"}
+	}
+	if c.SSH.DeviceBinDir == "" {
+		c.SSH.DeviceBinDir = "./dist/device"
 	}
 }

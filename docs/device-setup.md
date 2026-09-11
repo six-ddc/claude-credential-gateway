@@ -3,12 +3,13 @@
 面向**设备使用者**：你有一台电脑（自己的笔记本、公司机器、临时的开发机），想用上网关背后那个订阅，
 但**不想在这台机器上落地真 token**。
 
-> 全程你**不需要、也不会拿到**登录网关机的权限。设备能做的只有建一条隧道。
+> 全程你**不需要、也不会拿到**登录网关机的权限。设备能做的只有让分流代理经 SSH 连上网关、
+> 请求白名单里的转发目标,以及经同一条 SSH 层取回自己的那份二进制。
 >
 > 跑完之后你会得到一个 `ccgw` 命令：用法和 `claude` 一模一样，额度算在网关那个订阅上，
 > `/usage` 也能正常看到剩余额度。
 >
-> 网关管理员侧的部署看 [README](../README.md#快速开始)；隧道口上跑什么协议看
+> 网关管理员侧的部署看 [README](../README.md#快速开始)；本机分流代理和网关之间跑什么协议看
 > [README「隧道口上跑的是什么」](../README.md#隧道口上跑的是什么)；客户端行为的源码依据看
 > [transport.md](./transport.md)。
 
@@ -31,12 +32,13 @@
 
 ```bash
 # 检查这些命令都在（macOS / 常见 Linux 一般自带）
-for c in ssh ssh-keygen ssh-keyscan curl openssl awk pkill; do
+for c in ssh ssh-keygen ssh-keyscan curl openssl awk; do
   command -v "$c" >/dev/null && echo "✓ $c" || echo "✗ $c  ← 缺这个"
 done
 ```
 
-缺 `pkill` 的话（少数精简 Linux 镜像）装 `procps`：`apt install procps` / `yum install procps-ng`。
+不需要装 Go：设备端跑的那个二进制由网关编译好、经 SSH 分发下来，本机只要有一个能跑 SSH 客户端的
+系统即可。
 
 ### Claude Code：先查现状，再决定要不要动
 
@@ -113,17 +115,18 @@ GATEWAY_HOST=gateway.example.com ./scripts/setup-device.sh laptop-1
   起个能认出是哪台机器的名字。不传的话默认是 `<主机名小写>-dev`。
 - 端口不是 2222 就再加 `GATEWAY_SSH_PORT=xxxx`。
 
-**这一趟一定会失败，这是设计好的。** 因为公钥还没在网关登记，隧道建不起来。脚本会捕获这个失败，
-把公钥打印出来：
+**这一趟一定会失败，这是设计好的。** 因为公钥还没在网关登记，脚本经 SSH 去取分流代理二进制
+那一步会被拒绝。脚本会捕获这个失败，把公钥打印出来：
 
 ```
 == 设备 id: laptop-1
 == 网关: gateway.example.com:2222
+== 平台: darwin/arm64
 == 已生成密钥: ~/.ccgw/ccgw_laptop-1(私钥只留本机)
 ⚠ 未提供 GATEWAY_HOST_KEY_FP,按 TOFU 接受。请与管理员人工核对:
      SHA256:abc123...
 
-✗ 隧道没建起来。最常见的原因是【这台设备的公钥还没在网关登记】。
+✗ 连不上网关的 SSH 层。最常见的原因是【这台设备的公钥还没在网关登记】。
 
   把下面这行公钥,连同设备 id "laptop-1",交给网关管理员:
 
@@ -154,6 +157,10 @@ SHA256:abc123defg456...
 **收到后先核对**：它应该和你第一趟输出里那行 `SHA256:...` 一致。不一致就停下来问管理员，
 别继续（可能是中间人，也可能是网关轮换了 host key）。
 
+> 如果管理员那边网关上还没有你这个平台（比如 `darwin/arm64`）的设备端二进制，你的第一趟会
+> 报另一种错误：`✗ 网关上没有 darwin/arm64 的设备端二进制`。这不是公钥的问题，让管理员在
+> 网关机上跑一次 `make device-bins` 就好。
+
 ---
 
 ## 3. 第二趟：带指纹正式接入
@@ -169,24 +176,28 @@ GATEWAY_HOST_KEY_FP='SHA256:abc123defg456...' \
 ```
 == 设备 id: laptop-1
 == 网关: gateway.example.com:2222
+== 平台: darwin/arm64
 == host key 指纹已核对: SHA256:abc123defg456...
-== 隧道已建立: 127.0.0.1:8788 → gateway.example.com:2222
-== 网关 CA: ~/.ccgw/ccgw_ca.crt (CN=claude-credential-gateway CA)
+== 已取到分流代理二进制: ~/.ccgw/bin/ccgw-device-bin
+分流代理已就绪: http://127.0.0.1:8788
+== 网关 CA: ~/.ccgw/ccgw_ca.crt (subject=CN=claude-credential-gateway CA)
 == /status: {}
 == Claude Code 版本: 2.1.222 (>= 2.1.197,OK)
 == 占位凭证: ~/.ccgw/claude-home/.credentials.json (scopes 含 user:profile,/usage 才肯发请求)
 == 已生成包装命令: ~/.ccgw/bin/ccgw
 ```
 
-脚本这一趟做了 8 件事：核对指纹并 pin → 建隧道（一个本地端口）→ 经隧道自取 CA 证书 →
-**经代理**打一次 `https://api.anthropic.com/status` 验证整条链路 → 检查 claude 版本 →
-写占位凭证 → 生成包装命令 → 打印下一步。
+脚本这一趟做了几件事：核对指纹并 pin → 经 SSH exec 取回分流代理二进制 → 生成起停脚本并拉起
+分流代理（设备上**唯一的常驻进程**）→ 经它自取 CA 证书 → **经它**打一次
+`https://api.anthropic.com/status` 验证整条链路（本机 → 分流代理 → 网关 → 上游）→ 检查 claude
+版本 → 写占位凭证 → 生成包装命令 → 打印下一步。
 
 > `== /status: {}` 是**正常的**。网关还没转发过真实请求时没有限额快照可报，就回空对象。
 > 用过一阵之后这里会显示 5h/7d 的剩余额度。
 
-> 那一个本地端口（默认 `127.0.0.1:8788`）身兼两职：`ccgw` 的 `HTTPS_PROXY` 指向它，
-> 取 CA 和查 `/status` 的普通 HTTP 请求也打它。网关按连接开头的字节自动分辨。
+> 那一个本地端口（默认 `127.0.0.1:8788`）现在是分流代理自己的监听口，不再是 SSH 转发出来的
+> 隧道口：`ccgw` 的 `HTTPS_PROXY` 指向它，取 CA 和查 `/status` 的普通 HTTP 请求也打它。它内部
+> 按目标主机分流,只有 `api.anthropic.com` 才继续经 SSH 送去网关,其余流量分流代理自己直连。
 
 **指纹不符会直接中止**，这是它该做的：
 
@@ -222,6 +233,16 @@ ccgw --version
 
 交互式里敲 `/usage` 能看到网关那个订阅的剩余额度（5h / 7d 那几条）——它依赖脚本写的占位凭证里
 带了 `user:profile` scope，详见 [§7 环境变量速查](#7-环境变量速查)。
+
+分流代理本身用同一目录下的 `ccgw-device` 管理，平时不需要手动碰它——`ccgw` 会在需要时自动
+拉起：
+
+```bash
+ccgw-device status    # 在不在跑、网关链路通不通
+ccgw-device log        # 跟一下它的日志（默认最后 50 行,-f 跟随)
+ccgw-device stop       # 手动停掉
+ccgw-device start      # 手动拉起
+```
 
 > 只想要交互式 shell 里的别名也行：`alias ccgw="$HOME/.ccgw/bin/ccgw"`。
 > 但推荐 PATH 形态——别名在脚本、`make`、编辑器插件等子进程里**不生效**。
@@ -279,77 +300,60 @@ jq '.hasCompletedOnboarding = true | .theme = (.theme // "dark")' "$F" > "$F.tmp
 
 ## 6. 日常使用
 
-### 隧道断了怎么办
+### 分流代理断了怎么办
 
-隧道是一个后台 `ssh -f -N` 进程。**它会自己退出，而且不会自动重连**——这一点值得说清楚，
-否则很容易以为是进程"莫名挂掉"：
+分流代理自己维护一条到网关的 SSH 连接,不需要你手动重连。它每 30 秒(`SSH_ALIVE_INTERVAL`)
+发一次 keepalive,连续 3 次(`SSH_ALIVE_COUNT_MAX`)没回应——合计约 90 秒——就判定链路已死,
+主动断开。**这不代表分流代理进程退出**:它还在监听本机端口,只是下一个要经网关的请求会先按
+指数退避(1 秒起,最长 30 秒)重拨一次。链路断的这段时间里,经网关的请求(`api.anthropic.com`)
+会收到 502;其它主机因为本来就走本机直连,不受影响。
 
-保活参数是 `ServerAliveInterval=30` 配 `ServerAliveCountMax=3`，也就是每 30 秒探一次、
-连续 3 次没回应（合计 90 秒）就判定链路已死。ssh 手册对这个组合的说法是
-「if the server becomes unresponsive, ssh will disconnect」——**保活的职责是尽早发现链路死了
-并退出，不是把它救回来**。ssh 一退，本地端口就没了，直到你再跑一次脚本。建隧道成功时脚本会把
-这个时长打出来，方便对照。
+真正会让你没法用的,是**分流代理这个进程本身没了**——电脑重启、被手动杀掉之类。这种情况
+`ccgw` 会自动发现并拉起来(它调用前会先探一下 `/status`,答不上来就跑 `ccgw-device start`),
+你通常不需要手动管它。想自己看一眼:
 
-所以下面这些日常动作都足以让隧道消失：合盖休眠后唤醒（TCP 连接在恢复时通常已经死了）、
-WiFi 切换、VPN 开关、网关重启，以及任何超过 90 秒的网络中断。
+```bash
+ccgw-device status
+```
 
 网络经常抖的环境可以把判死时间调长，让短暂中断熬过去——前提是底层 TCP 连接还活着，
-休眠唤醒之后调多大都救不回来：
+休眠唤醒之后调多大都救不回来。这两个变量只在**首次接入或重跑脚本时**生效：
 
 ```bash
-SSH_ALIVE_INTERVAL=20 SSH_ALIVE_COUNT_MAX=6 ./scripts/setup-device.sh laptop-1   # 120 秒才判死
+SSH_ALIVE_INTERVAL=20s SSH_ALIVE_COUNT_MAX=6 ./scripts/setup-device.sh laptop-1   # 120 秒才判死
 ```
 
-断了之后**重跑脚本即可**，密钥和登记都会复用：
+### 检查分流代理到底活没活
 
 ```bash
-GATEWAY_HOST=gateway.example.com \
-GATEWAY_HOST_KEY_FP='SHA256:abc...' \
-  ./scripts/setup-device.sh laptop-1
-```
+# ① 分流代理本身的进程还在不在
+ccgw-device status
 
-> ⚠️ **每次重跑都建议带上 `GATEWAY_HOST_KEY_FP`。**
-> 当前脚本在重跑时会用**新扫到的** host key **无条件覆盖** `~/.ccgw/known_hosts`
-> （`awk ... > "$KNOWN_HOSTS"`，不管有没有传指纹）。也就是说**不带指纹重跑 = 又做了一次 TOFU**，
-> 之前 pin 住的那把会被静默替换掉——此时如果正好有中间人，你不会收到任何警告。
-> 带上指纹就会走显式比对，不符即中止。
->
-> 把它连同网关地址存成一个 shell 函数会省事很多：
->
-> ```bash
-> # ~/.zshrc
-> ccgw-up() {
->   GATEWAY_HOST=gateway.example.com \
->   GATEWAY_HOST_KEY_FP='SHA256:abc123defg456...' \
->     ~/path/to/setup-device.sh laptop-1
-> }
-> ```
-
-### 检查隧道到底活没活
-
-```bash
-# ① 看 ssh 进程还在不在
-pgrep -fl "ccgw_laptop-1"
-
-# ② 打一下明文口（最轻）
+# ② 打一下它的本机口(最轻)
 curl -s http://127.0.0.1:8788/status
 
-# ③ 完整走一遍客户端要走的路：代理 + TLS 终结 + 校验网关 CA（最可靠）
+# ③ 完整走一遍客户端要走的路:分流代理 + SSH + 网关 TLS 终结 + 校验网关 CA(最可靠)
 curl -s -x http://127.0.0.1:8788 --cacert ~/.ccgw/ccgw_ca.crt \
      https://api.anthropic.com/status
 ```
 
-第 ② 条能通说明隧道活着（`ccgw` 启动前的自检就是它）；第 ③ 条还额外验证了 CA 对不对。
+第 ② 条能通说明分流代理活着；第 ③ 条还额外验证了到网关的链路和 CA 对不对。
 
 ### 开机自动重连（可选）
 
-macOS 用 launchd、Linux 用 systemd user unit 或 cron `@reboot` 都行。最省事的办法是往 rc 里塞一行
-惰性检查——只在代理口连不上时才重建：
+日常不需要专门配这个——`ccgw` 每次调用前都会自检,分流代理没起来就自动拉起。真想让它开机
+就常驻(比如这台机器上还跑着别的、依赖它一直在的东西),macOS 用 launchd、Linux 用 systemd
+user unit 都行,起的命令就是：
 
 ```bash
-# ~/.zshrc（可选）
-curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || \
-  GATEWAY_HOST=gateway.example.com ~/path/to/setup-device.sh laptop-1 >/dev/null 2>&1
+~/.ccgw/bin/ccgw-device start
+```
+
+或者跟 `ccgw` 一样惰性检查,塞进 rc 文件里：
+
+```bash
+# ~/.zshrc(可选)
+curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || ~/.ccgw/bin/ccgw-device start >/dev/null 2>&1
 ```
 
 ---
@@ -366,21 +370,21 @@ curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || \
 | `CMD_NAME` | `ccgw` | 生成的包装命令名；不能叫 `claude` |
 | `MIN_CLAUDE_VERSION` | `2.1.197` | 版本下限，低于**直接中止** |
 | `ALLOW_OLD_CLAUDE` | 空 | 设成 `1` 强行放行低版本（自担后果） |
-| `CCGW_HOME` | `~/.ccgw` | 密钥、CA、占位凭证、包装命令的存放目录 |
+| `CCGW_HOME` | `~/.ccgw` | 密钥、CA、占位凭证、分流代理、包装命令的存放目录 |
 | `PLACEHOLDER_TOKEN` | `sk-ant-oat01-placeholder` | 占位凭证里的假 token，所有设备可以一样 |
 | `SUBSCRIPTION_TYPE` | `max` | 占位凭证声明的档位；只影响 `/usage` 显示哪几条限额 |
-| `LOCAL_PROXY_PORT` | `8788` | 本机代理入口端口，`HTTPS_PROXY` 指向它 |
-| `PERMIT_TCP` | `127.0.0.1:8788` | 隧道右端目标，须与网关 `permit_targets` 一致 |
+| `LOCAL_PROXY_PORT` | `8788` | 分流代理的本机监听端口，`HTTPS_PROXY` 指向它 |
+| `PERMIT_TCP` | `127.0.0.1:8788` | 分流代理开 SSH channel 时声明的目标，须与网关 `permit_targets` 一致 |
 | `REAL_CLAUDE_HOME` | `~/.claude` | 从哪儿把设置/记忆/历史链过来 |
-| `SSH_ALIVE_INTERVAL` | `30` | 隧道保活探测间隔（秒） |
-| `SSH_ALIVE_COUNT_MAX` | `3` | 连续几次探测无响应就判链路已死。两值相乘＝判死用时，默认 90 秒 |
+| `SSH_ALIVE_INTERVAL` | `30s` | 分流代理到网关那条 SSH 连接的 keepalive 间隔（Go duration,如 `20s`、`1m`） |
+| `SSH_ALIVE_COUNT_MAX` | `3` | 连续几次 keepalive 无应答就判链路已死。两者相乘 ≈ 判死用时,默认约 90 秒 |
 
 `ccgw` 内部**替你设好**的（你不用管，列出来只为让你知道发生了什么）：
 
 | 变量 | 值 | 作用 |
 |---|---|---|
-| `HTTPS_PROXY` / `HTTP_PROXY`（含小写） | `http://127.0.0.1:8788` | 把 claude 的全部 HTTP(S) 流量赶进隧道 |
-| `NO_PROXY` / `no_proxy` | `localhost,127.0.0.1,::1` | 本机地址不走代理，否则本地跑的 MCP server / dev server 也会被绕去网关 |
+| `HTTPS_PROXY` / `HTTP_PROXY`（含小写） | `http://127.0.0.1:8788` | 把 claude 的全部 HTTP(S) 流量交给分流代理 |
+| `NO_PROXY` / `no_proxy` | `localhost,127.0.0.1,::1` | 本机地址不走代理，否则本地跑的 MCP server / dev server 也会被绕去分流代理 |
 | `NODE_EXTRA_CA_CERTS` | `~/.ccgw/ccgw_ca.crt` | 信任网关自建 CA（它要终结 `api.anthropic.com` 的 TLS） |
 | `CLAUDE_CONFIG_DIR` | `~/.ccgw/claude-home` | 独立配置目录，占位凭证放这儿，不碰你真的 `~/.claude` |
 | `ANTHROPIC_API_KEY` 等 4 个 | **unset** | 任何残留都会让 claude 绕开网关或改发 `x-api-key` |
@@ -401,10 +405,9 @@ curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || \
 不给 `refreshToken`、`expiresAt` 又设到 2100 年，是为了让客户端别去刷新——拿占位 token 刷新
 必然失败，还会重试、拖慢启动。
 
-> **设备上的全部 HTTPS 流量都会经过网关**：遥测、WebFetch 抓的网页、MCP server 全走这条代理，
-> 没有从你本机 IP 直连出去的旁路。能出到哪些站点由网关代码里的盲转发名单决定，名单只放行
-> Claude Code 自身要用的那些主机，抓名单外的站点会拿到 403（要加得找管理员改网关代码）。
-> 只有 `api.anthropic.com` 会被网关解密并换上真凭证，其余都是不解密的 TCP 盲转发。
+> **只有到 `api.anthropic.com` 的流量经过网关**:分流代理按目标主机分流,遥测、WebFetch 抓的
+> 网页、npm、第三方 MCP server 都由分流代理直接从本机连出去,网关看不到、也管不了那部分流量。
+> 认得出「该走网关」的主机由 `--via-gateway` 决定,默认只有 `api.anthropic.com`。
 
 ---
 
@@ -420,13 +423,19 @@ nc -vz gateway.example.com 2222      # 通不通
 
 不通 → 网关没启动、防火墙/安全组没放行、或者地址端口写错了。找管理员。
 
-### `✗ 隧道没建起来`
+### `✗ 连不上网关的 SSH 层`
 
 99% 是**公钥还没登记**（第一趟必然如此）。如果第二趟还这样，检查：
 
 - 交给管理员的公钥是不是**完整一行**（`ssh-ed25519 AAAA... laptop-1`，别漏尾巴也别多换行）
 - 用的**设备 id 是否一致**——脚本用 `laptop-1@网关` 登录，id 和登记时必须一模一样
 - 让管理员跑 `./scripts/add-device.sh --list` 确认登记上了
+
+### `✗ 网关上没有 <os>/<arch> 的设备端二进制`
+
+公钥没问题，SSH 层认证通过了，但网关那台机器上没编译出你这个平台的分流代理二进制。
+找管理员在网关机上跑一次 `make device-bins`（默认产出 darwin/arm64、darwin/amd64、
+linux/amd64、linux/arm64 四种，够用的话不用改）。
 
 ### `✗ host key 指纹不符`
 
@@ -437,35 +446,45 @@ nc -vz gateway.example.com 2222      # 通不通
 rm ~/.ccgw/known_hosts
 ```
 
+### `✗ 分流代理起来了但网关链路没通`
+
+分流代理进程成功监听了本机端口，但 10 秒内没能通过它自己的 `/status` 自检，多半是它连不上
+网关的 SSH 层（网关重启中、网络抖动、host key 变了但没重新核对……）。看日志找具体原因：
+
+```bash
+ccgw-device log
+```
+
 ### `✗ 取 CA 失败(网关版本太旧?需要支持 GET /ca)`
 
-隧道建起来了但 `GET /ca` 没成功。多半是网关版本旧、没有 `/ca` 这个端点。找管理员升级。
+分流代理已经起来了，但转发过去的 `GET /ca` 没成功。多半是网关版本旧、没有 `/ca` 这个端点。
+找管理员升级。
 
-### `✗ 经代理访问 /status 失败(网关版本太旧?需要支持 CONNECT)`
+### `✗ 经代理访问 /status 失败`
 
-隧道和 CA 都拿到了，但代理这条路不通。基本是网关版本旧、还不会处理 `CONNECT`。找管理员升级。
+前面都通了，但走完整链路(分流代理 → 网关 → TLS 终结)的这次 `/status` 没成功。看
+`ccgw-device log` 找具体报错；常见原因是网关刚重启、还没就绪。
+
+### 请求收到 502 `{"error":"upstream unreachable",...}`
+
+这是分流代理自己回的，不是网关。`host` 字段是拨号失败的目标：如果是 `api.anthropic.com`，
+说明它到网关的 SSH 链路当时不通（正在退避重连）；如果是别的主机，说明分流代理直连那个站点
+失败了，和网关无关，多半是网络或目标站点本身的问题。
 
 ### `✗ Claude Code 版本过低`
 
 必须升级，见 [§0](#claude-code先查现状再决定要不要动)。真要用旧版：
 `ALLOW_OLD_CLAUDE=1 ./scripts/setup-device.sh laptop-1`。
 
-### `✗ 隧道未就绪(http://127.0.0.1:8788 连不上)`（跑 `ccgw` 时）
-
-隧道断了，重跑 `setup-device.sh`。
-
 ### 端口 8788 被本机别的程序占了
-
-**症状会伪装成别的问题**：脚本用了 `ExitOnForwardFailure=yes`，端口绑不上 ssh 就立刻退出，
-于是报的是「隧道没建起来，最常见的原因是公钥还没登记」——公钥其实好好的。先确认一下谁占着：
 
 ```bash
 lsof -nP -iTCP:8788 -sTCP:LISTEN
 ```
 
-是自己的僵死隧道就 `pkill -f 'ssh.*ccgw_'` 清掉；是别人的服务就换一个端口：
-`LOCAL_PROXY_PORT=18788 ./scripts/setup-device.sh laptop-1`。改的只是本机这一端，
-隧道右端（`PERMIT_TCP`）不用动，包装命令会跟着一起重建。
+是自己之前没清掉的分流代理就 `ccgw-device stop`；是别人的服务就换一个端口：
+`LOCAL_PROXY_PORT=18788 ./scripts/setup-device.sh laptop-1`。改的只是分流代理自己的监听口，
+它到网关的 SSH 目标（`PERMIT_TCP`）不用动，包装命令会跟着一起重建。
 
 ### `⚠ PATH 里已存在同名命令 ccgw -> /usr/bin/ccgw`
 
@@ -477,12 +496,15 @@ lsof -nP -iTCP:8788 -sTCP:LISTEN
 
 ### `ccgw` 报 TLS / 证书错误
 
-`NODE_EXTRA_CA_CERTS` 指的 CA 和网关当前的对不上（常见于网关重新生成过 CA）。重跑脚本重新取：
+`NODE_EXTRA_CA_CERTS` 指的 CA 和网关当前的对不上（常见于网关重新生成过 CA）。重新取一份即可
+（分流代理本身不用重启）：
 
 ```bash
 rm ~/.ccgw/ccgw_ca.crt
-GATEWAY_HOST=... GATEWAY_HOST_KEY_FP='SHA256:...' ./scripts/setup-device.sh laptop-1
+curl -sf http://127.0.0.1:8788/ca -o ~/.ccgw/ccgw_ca.crt
 ```
+
+还是不对就重跑一遍完整的第二趟接入脚本。
 
 ### 请求 401 / `invalid x-api-key`
 
@@ -490,16 +512,15 @@ GATEWAY_HOST=... GATEWAY_HOST_KEY_FP='SHA256:...' ./scripts/setup-device.sh lapt
 和网关注入的 Bearer 头冲突。`ccgw` 内部会 unset 这几个，但如果你是**手动**设环境变量跑 `claude`，
 就得自己清干净。用 `ccgw` 就不会有这个问题。
 
-### WebFetch 抓不到某个网站 / 第三方 MCP server 连不上
+### `✗ host not served by gateway` / WebFetch 抓不到某个网站、第三方 MCP server 连不上
 
-网关只放行 Claude Code 自身要用的那些主机，其它目标一律 403。确认一下是不是撞在这上面：
+正常使用下**不会看到这个了**：WebFetch、npm、第三方 MCP server 这些请求现在由分流代理直接从
+设备本机连出去，根本不经过网关，也就没有网关这边的 403 需要排查。如果连不上，原因和你平时用
+普通网络时一样（DNS、防火墙、目标站点本身），跟这个网关无关。
 
-```bash
-curl -sv -x http://127.0.0.1:8788 https://example.com 2>&1 | grep -i '403\|host not permitted'
-```
-
-看到 `host not permitted by gateway` 就是名单拦的，响应 body 里带被拒的主机名。名单写死在网关
-代码里，要放行得找管理员改代码重新部署——这是有意的设计，不是配置漏了。
+如果你确实在响应里看到了 `host not served by gateway` 这句话，说明 `HTTPS_PROXY` 被指到了
+网关的隧道端口而不是分流代理——多半是还在用老版本的接入方式，参见
+[docs/migration.md](./migration.md)。
 
 ### `/usage` 显示 "only available for subscription plans"
 
@@ -539,7 +560,7 @@ cat ~/.ccgw/claude-home/.credentials.json          # scopes 应含 user:profile
 那能不能「把拉下来的 CA 直接信了」？不能，那是循环论证：
 
 ```
-CA 可信 ← 因为隧道可信 ← 因为对面确实是网关 ← ？？？
+CA 可信 ← 因为 SSH 连接可信 ← 因为对面确实是网关 ← ？？？
 ```
 
 最后那个问号就是指纹。拿掉它，你信任的就是「**任何应答了这个连接的人**」给你的 CA。
@@ -555,7 +576,16 @@ CA 可信 ← 因为隧道可信 ← 因为对面确实是网关 ← ？？？
 
 **指纹本身是一次性索取的**——管理员给你一次，你存下来长期复用。但注意当前脚本的实现细节：
 每次重跑都会用新扫到的 key 覆盖 `known_hosts`，**所以每次重跑都该把指纹带上**，
-否则那一次就退化成 TOFU（见 [§6](#隧道断了怎么办)）。指纹不变的话，存成 shell 函数一劳永逸。
+否则那一次就退化成 TOFU。指纹不变的话，存成 shell 函数一劳永逸：
+
+```bash
+# ~/.zshrc
+ccgw-up() {
+  GATEWAY_HOST=gateway.example.com \
+  GATEWAY_HOST_KEY_FP='SHA256:abc123defg456...' \
+    ~/path/to/setup-device.sh laptop-1
+}
+```
 
 只有网关真的轮换了 host key 时，你才需要向管理员要一个新指纹。
 
@@ -568,9 +598,13 @@ CA 可信 ← 因为隧道可信 ← 因为对面确实是网关 ← ？？？
 ├── ccgw_laptop-1          # 设备 SSH 私钥（600）—— 永不外传
 ├── ccgw_laptop-1.pub      # 公钥 —— 就是交给管理员的那行
 ├── ccgw_ca.crt            # 网关 CA 证书 —— NODE_EXTRA_CA_CERTS 指它
-├── known_hosts            # pin 住的网关 host key
+├── known_hosts            # pin 住的网关 host key(分流代理和脚本里的 ssh 都读它)
+├── device.pid             # 分流代理的 pid 文件
+├── device.log             # 分流代理的日志
 ├── bin/
-│   └── ccgw               # 包装命令
+│   ├── ccgw               # 包装命令
+│   ├── ccgw-device        # 起停分流代理:start|stop|status|log
+│   └── ccgw-device-bin    # 分流代理本体(经 ssh exec 从网关取回的二进制)
 └── claude-home/           # ccgw 专用的 CLAUDE_CONFIG_DIR
     ├── .credentials.json  # 占位凭证（600）—— 假 token + user:profile scope
     ├── .claude.json       # ccgw 自己的 onboarding / 目录信任记录（跑过才有）
@@ -585,8 +619,8 @@ CA 可信 ← 因为隧道可信 ← 因为对面确实是网关 ← ？？？
 **不再用了想彻底清掉**：
 
 ```bash
-pkill -f "ccgw_laptop-1"          # 断隧道
-rm -rf ~/.ccgw                    # 只删链接本身，不会动到真 ~/.claude 里的内容
+~/.ccgw/bin/ccgw-device stop      # 停掉分流代理
+rm -rf ~/.ccgw                    # 只删链接本身,不会动到真 ~/.claude 里的内容
 # 再把 ~/.zshrc 里那行 export PATH=... 删掉
 ```
 

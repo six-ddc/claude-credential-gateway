@@ -31,22 +31,25 @@ upstream:
   # 刷新用哪个 claude;留空就是裸 "claude" 走 PATH(claude 自更新换了路径也不受影响)。
   claude_bin: ""
 
-# 代理的主机名单(哪个域名解密注入真凭证、哪些只做盲转发)写死在代码里,不是配置项 ——
-# 「真凭证送给谁」和「设备能出到哪儿」都不该是部署时随手改的东西。见 proxy.go 顶部,
-# 网关启动时也会把两份名单打出来。要放行别的主机就改代码重编译。
+# 网关只服务 api.anthropic.com(解密注入真凭证),其它主机一律 403;设备上的分流代理
+# 只把这一个主机送过来,其余流量从设备本机直连。这一条和路径黑名单(Artifact、Remote
+# Control 等)都写死在 proxy.go 里,不是配置项 ——「真凭证送给谁」不该是部署时随手改的东西。
 
 # 转发-only SSH 层:唯一对外入口(始终启用)。设备身份 = SSH 公钥,单一数据源就是下面的
 # authorized_keys;客户端发的占位凭证网关不校验,只覆盖。
-# 公钥认证、只能转发到 permit_target、无 shell/exec、禁 -R。详见 docs/transport.md。
+# 公钥认证、只能转发到 permit_target、无 shell/pty、禁 -R;session 上只认一条 exec:
+# `device-binary <os>/<arch>`,把设备端二进制发给已认证设备。详见 docs/transport.md。
 ssh:
   addr: ":2222"                       # 唯一对外端口
   host_key: ./ssh_host_ed25519_key    # 服务端私钥(机密,已 gitignore);不存在则首启自动生成
   ca_key: ./ccgw_ca_key               # TLS 终结 CA(机密);自动生成,另导出 ccgw_ca_key.crt 给设备信任
-  # 转发白名单:客户端 -L 声明的目标须在其中(网关并不真监听它们)。
-  # tcp 那项是代理形态用的;unix 那项留着兼容老设备的 ANTHROPIC_UNIX_SOCKET 形态。
+  # 转发白名单:设备侧分流代理开 channel 时声明的目标须在其中(网关并不真监听它们)。
+  # unix 那项是 ANTHROPIC_UNIX_SOCKET 形态用的。
   permit_targets:
     - 127.0.0.1:8788
     - unix:/run/ccgw.sock
+  # 设备端二进制目录(<dir>/<os>/<arch>),`make device-bins` 产出;设备接入脚本经 ssh 取。
+  device_bin_dir: ./dist/device
   authorized_keys:                    # 可信设备公钥,每台一项;改 config.yaml 重读即生效
     - id: laptop-1
       key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA-REPLACE-ME laptop-1"

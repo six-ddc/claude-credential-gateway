@@ -5,6 +5,44 @@ import (
 	"testing"
 )
 
+// Artifact(/api/frame/*)与 Remote Control(会话的 worker、bridge)要拦;
+// 模型调用、账号接口、以及同在 /v1/code/sessions 下的 teleport 列表不能误伤。
+func TestBlockedPaths(t *testing.T) {
+	blocked := []string{
+		"/api/frame/deploy/direct",
+		"/api/frame/read/abc123",
+		"/api/frame/contract/latest",
+		"/api/frame/frames",
+		"/v1/code/sessions/cse_01PXmK/worker",
+		"/v1/code/sessions/cse_01PXmK/worker/register",
+		"/v1/code/sessions/cse_01PXmK/worker/events/stream",
+		"/v1/code/sessions/cse_01PXmK/bridge",
+		"/v1/environments/bridge",
+		"/v1/environments/bridge/env_123",
+	}
+	for _, p := range blocked {
+		if !isBlockedPath(p) {
+			t.Fatalf("%s 应被拦下", p)
+		}
+	}
+	allowed := []string{
+		"/v1/messages",
+		"/api/oauth/usage",
+		"/api/frames",
+		"/api/framex",
+		"/v1/code/sessions",
+		"/v1/code/sessions/cse_01PXmK",
+		"/v1/code/sessions/cse_01PXmK/client/presence",
+		"/v1/code/sessions/cse_01PXmK/events",
+		"/v1/environments/env_123/bridge/reconnect",
+	}
+	for _, p := range allowed {
+		if isBlockedPath(p) {
+			t.Fatalf("%s 不该被拦", p)
+		}
+	}
+}
+
 // 客户端的凭证企图不能到上游:x-api-key 必须剥掉,否则上游拿它校验 → 401。
 // (设备上残留 ANTHROPIC_API_KEY 时,claude 就会改发 x-api-key。)
 func TestClientCredentialsStripped(t *testing.T) {

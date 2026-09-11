@@ -12,31 +12,43 @@
 ## 工作原理
 
 ```
-设备(原生 claude,HTTPS_PROXY 指向本地隧道口)
-  │  ssh -N -L 8788:127.0.0.1:8788 -p 2222 laptop-1@网关机   ← 唯一对外端口,公钥认证
+设备(原生 claude,HTTPS_PROXY 指向本机分流代理 ccgw-device)
+  │
   ▼
-转发-only SSH 层(:2222)
-  · 公钥 → device id,这是唯一门禁
-  · 只接受转发 channel,且目标必须在白名单里
-  · 无 shell / 无 exec / 无 pty,禁 -R 反向转发
-  · host key pin 防 MITM
-  ▼
-进程内网关(转发 channel 直连,不监听任何 HTTP 端口)
-  · CONNECT api.anthropic.com → 就地 TLS 终结 → 剥掉客户端凭证、注入真订阅 token
-  · CONNECT 其它主机          → 纯 TCP 盲转发,不解密也不注入
-  · 普通 HTTP                 → GET /ca 取 CA、GET /status 看限额
-  · per-device 审计 + 5h/7d 限额被动采样
-  ▼
-api.anthropic.com(注入)/ 其它站点(盲转发)
+设备侧分流代理(:8788,唯一常驻进程)—— 按 CONNECT/请求的目标主机分两路
+  │
+  ├─ api.anthropic.com ──▶ 经它自己维护的 SSH 连接(公钥认证,known_hosts pin,断了按需重拨)
+  │                          │
+  │                          ▼
+  │                   转发-only SSH 层(:2222,网关唯一对外端口)
+  │                    · 公钥 → device id,这是唯一门禁
+  │                    · 只接受白名单内的转发目标
+  │                    · session 只认一条 exec:发设备端二进制,无 shell / 无 pty
+  │                    · 禁 -R 反向转发,host key pin 防 MITM
+  │                          │
+  │                          ▼
+  │                   进程内网关(转发 channel 直连,不监听任何 HTTP 端口)
+  │                    · CONNECT api.anthropic.com → 就地 TLS 终结 → 剥掉客户端凭证、注入真订阅 token
+  │                    · 路径黑名单(Artifact、Remote Control)按 path 拦
+  │                    · per-device 审计 + 5h/7d 限额被动采样
+  │                          │
+  │                          ▼
+  │                   api.anthropic.com(注入真凭证)
+  │
+  └─ 其它主机(WebFetch 抓的网站、npm、第三方 MCP server、遥测……)
+       ──▶ 分流代理自己直连,纯字节对拷,网关完全看不见
 ```
 
 几个要点:
 
+- **设备上只有一个常驻进程**:分流代理 `ccgw-device`。`HTTPS_PROXY` 指向它,它按目标主机分流,
+  只把 `api.anthropic.com` 送去网关,其余流量直接从设备本机出去 —— 网关不再是设备的出口代理。
 - **网关不监听任何 HTTP 端口**。转发 channel 在进程内被直接喂给 HTTP handler,不经过本机端口,
   所以网关机上的其它进程也偷用不了真凭证。
 - **身份来自 SSH 公钥**,写进每个请求的 context,客户端伪造不了。设备台账的单一数据源就是
   `ssh.authorized_keys`。
-- **设备对网关机没有任何登录权限**,能做的只有建隧道。
+- **设备对网关机没有任何登录权限**。SSH 层的 session channel 只认一条 exec(`device-binary
+  <os>/<arch>`,分发分流代理二进制本身),没有 shell、没有 pty。
 - **上游 path 原样透传**:客户端打哪个端点就转哪个(`/v1/messages`、`/api/oauth/usage`……),
   网关只换 `Host` 和 `Authorization`。
 - 同时,网关会**打印每个请求的 model 与 token 使用量**(input / output / cache),用 `gjson`
@@ -59,6 +71,11 @@ interceptor,又 `setGlobalDispatcher` 给 undici 装 `EnvHttpProxyAgent`。这�
 代价是网关要会说 HTTP 代理协议:客户端先发 `CONNECT api.anthropic.com:443`,网关回
 `200 Connection Established`,之后才在这条连接上做 TLS 握手 —— TLS 终结这一步该干的活不变,
 只是触发时机从「连上来就握手」变成「CONNECT 之后再握手」。
+
+`HTTPS_PROXY` 实际指向的是设备侧的分流代理(`ccgw-device`),不是网关本身:它对客户端伪装成
+一个普通的 HTTP 代理,同样吃 CONNECT,只是按目标主机再分一次流 —— 只有 `api.anthropic.com`
+才继续往网关走,其余主机它自己拨号应答。为什么这层分流不能靠 `NO_PROXY` 之类的环境变量做,
+见 [docs/transport.md](docs/transport.md#7-设备侧分流代理)。
 
 ## 技术栈
 
@@ -87,9 +104,10 @@ ssh:                      # 唯一对外入口;设备台账的单一数据源
   addr: ":2222"                       # 唯一对外端口
   host_key: ./ssh_host_ed25519_key    # 服务端私钥;不存在则首启自动生成
   ca_key: ./ccgw_ca_key               # TLS 终结 CA;自动生成,另导出 .crt
-  permit_targets:                     # 客户端 -L 声明的目标须在其中(网关并不真监听它们)
+  permit_targets:                     # 分流代理开 channel 时声明的目标须在其中(网关并不真监听它们)
     - 127.0.0.1:8788
     - unix:/run/ccgw.sock
+  device_bin_dir: ./dist/device       # 设备端二进制目录(<dir>/<os>/<arch>),`make device-bins` 产出
   authorized_keys:                    # 每台设备一把公钥;改完热重载即生效,无需重启
     - id: laptop-1
       key: "ssh-ed25519 AAAA... laptop-1"
@@ -100,7 +118,7 @@ ssh:                      # 唯一对外入口;设备台账的单一数据源
 可用环境变量覆盖:`GATEWAY_UPSTREAM_BASE`、`CLAUDE_GATEWAY_UPSTREAM_OAUTH`、
 `CLAUDE_GATEWAY_UPSTREAM_CREDENTIALS`、`CLAUDE_GATEWAY_UPSTREAM_REFRESH`、
 `CLAUDE_GATEWAY_CLAUDE_BIN`、`GATEWAY_SSH_ADDR`、`GATEWAY_SSH_HOST_KEY`、
-`GATEWAY_SSH_CA_KEY`、`GATEWAY_SSH_PERMIT_TARGETS`(逗号分隔)、
+`GATEWAY_SSH_CA_KEY`、`GATEWAY_SSH_PERMIT_TARGETS`(逗号分隔)、`GATEWAY_SSH_DEVICE_BIN_DIR`、
 `GATEWAY_SSH_AUTHORIZED_KEYS`(JSON `[{id,key}]`)。
 
 日志还有一个:`GATEWAY_LOG_FORMAT=json` 把事件日志切成 JSON(给采集器)。见「日志」。
@@ -188,50 +206,46 @@ fork 一次(单飞)。两条路径对「等」的容忍度不同:401 之后**阻
 
 ### 代理放行哪些主机
 
-配置里没有主机名单。哪个主机会被解密并注入真凭证、哪些只做盲转发,都写死在
-[`proxy.go`](./proxy.go) 里,**要放行别的主机就改代码重新编译** —— 让它进代码评审,而不是躺在
-某台机器的 YAML 里。「真凭证送给谁」和「设备能出到哪儿」都不该是部署时能随手改的东西。
+配置里没有主机名单。网关只服务**一个主机**:`api.anthropic.com`(`isMITMHost`,大小写不敏感)。
+其它主机一律 403,写死在 [`proxy.go`](./proxy.go) 里,不是配置项 —— 「真凭证送给谁」不该是
+部署时能随手改的东西。
 
-两份名单不是「白名单 vs 黑名单」,而是**两种不同的放行方式** —— 判断是「或」:
-
-| 主机 | 判在哪 | 网关怎么处理 |
-|---|---|---|
-| `api.anthropic.com` | `isMITMHost` | 解密 → 把占位 token 换成真凭证 → 转发 |
-| `tunnelHosts` 里的那些 | `hostInList` | 纯字节对拷,**不解密、不碰凭证** |
-| 其它 | 都不命中 | 403 |
-
-- **解密注入只认 `api.anthropic.com`**(大小写不敏感)。客户端无论上游配到哪儿,URL 里的主机名
-  始终是它,所以一个就够。它也**只能**走这条路:盲转发不解密,就没法替换 `Authorization`,而设备
-  手上只有占位 token —— 那样每个请求都会 401,网关就白做了。所以它不在 `tunnelHosts` 里不是被
-  漏掉,是压根不该在那儿。
-
-  官方表里挂在这个域下的「WebFetch 域名安全检查、特性开关拉取、遥测事件上报」因此走的都是注入
+- 客户端无论上游配到哪儿,URL 里的主机名始终是 `api.anthropic.com`,所以一个就够。它也
+  **只能**走这条路:不解密就没法替换 `Authorization`,而设备手上只有占位 token —— 那样每个
+  请求都会 401,网关就白做了。
+- 官方表里挂在这个域下的「WebFetch 域名安全检查、特性开关拉取、遥测事件上报」因此走的都是注入
   路径 —— 也就是说遥测是通的,并没有被关掉。
-- **`tunnelHosts` 管的是其余流量能出到哪儿**。设备设了 `HTTPS_PROXY` 之后,客户端的全部 HTTPS
-  流量都从网关出去,这份名单就是那部分的闸门。内容对齐官方《Enterprise network configuration》
-  列出的「Claude Code 需要访问的 URL」,共 12 个:`claude.ai`、`claude.com`、`code.claude.com`、
-  `platform.claude.com`、`downloads.claude.ai`、`raw.githubusercontent.com`、
-  `registry.npmjs.org`、`formulae.brew.sh`、`mcp-proxy.anthropic.com`、
-  `bridge.claudeusercontent.com`,以及两个遥测主机 `http-intake.logs.us5.datadoghq.com`、
-  `browser-intake-us5-datadoghq.com`。
 
-盲转发名单里的每一项支持三种写法:`*`(任意主机)、`*.example.com`(子域,不含 `example.com`
-自身)、精确主机名。
+**其余主机不该到网关这儿。** 它们该由设备侧的分流代理(见「隧道口上跑的是什么」)直接从设备
+本机连出去:WebFetch 抓的网站、npm 包源、第三方 MCP server、`platform.claude.com` 的 OAuth
+token 端点、`downloads.claude.ai`、`mcp-proxy.anthropic.com`、Datadog 遥测……全部从设备本机
+直连,网关完全看不见、也管不着。误把
+`HTTPS_PROXY` 直接指到网关隧道口(而不是经分流代理)的话,被拒的 `CONNECT` 会回一个说得清
+缘由的 403,body 里带主机名和提示 —— 客户端那头只看得到代理的状态码,这个 body 是排查依据。
 
-**这份名单只覆盖工具自身需要的主机。**`WebFetch` 抓名单外的站点、连第三方 remote MCP server
-都会被 403,这是有意的取舍,不要指望 WebFetch 能随便抓。被拒的 `CONNECT` 回的是一个说得清缘由的
-403,body 里有被拒的主机名和该往哪儿加的提示 —— 客户端那头只看得到代理的状态码,这个 body 是
-排查依据。
-
-`storage.googleapis.com` 是唯一刻意留在名单外的官方主机:它是多租户通用存储主机,放行等于开一条
-很宽的出口;而官方文档写明这个用途在它被挡时会回落到 `api.anthropic.com`,代价只是 `/plugin` 里
-看不到安装数与插件元数据。
-
-网关启动时会把两份名单打出来,不用翻源码就知道放行了谁:
+网关启动时会把这条打出来:
 
 ```
-代理: 解密注入 api.anthropic.com
-代理: 盲转发 claude.ai, claude.com, code.claude.com, ...
+代理: 只服务 api.anthropic.com(解密注入),其余主机 403
+```
+
+**注入主机上还有一份路径黑名单** `blockedPaths`。有些功能跟模型调用打同一个
+`api.anthropic.com`、用同一个 OAuth token,按主机分不开,只能按路径拦。模式是 Go `path.Match`
+语法(`*` 匹配一段),路径本身或它的任一父路径命中即算命中。只拦让功能跑不起来的核心端点,
+不追求列全外围请求:
+
+| 模式 | 拦的是什么 |
+|---|---|
+| `/api/frame` | Artifact 工具:把网页产物发布到 `claude.ai/code/artifact/…`,以及读写它的评论、数据库、附件。发布走 `/api/frame/deploy/*`,读回走 `/api/frame/read/<slug>`,其余 contract / comments / db / blob / subscribe 都在这个前缀下 |
+| `/v1/code/sessions/*/worker`、`/v1/code/sessions/*/bridge`、`/v1/environments/bridge` | Remote Control(`/remote-control`):本地会话向后端注册成 worker、建立 bridge 之后,claude.ai 网页和手机端就能读本地会话转录、向它下发指令。注册不成整个功能起不来。自托管 runner 复用同一组端点,一并失效 |
+
+命中时回 403,日志里 `reason=path_blocked`;客户端那头对应功能报错,模型调用不受影响。同在
+`/v1/code/sessions` 下的 `/teleport`、`/ultrareview`、`/schedule` 不在名单里,仍然可用。
+
+网关启动时会把这条也打出来:
+
+```
+代理: 路径黑名单 /api/frame, /v1/code/sessions/*/worker, /v1/code/sessions/*/bridge, /v1/environments/bridge
 ```
 
 ## 快速开始
@@ -243,6 +257,10 @@ fork 一次(单飞)。两条路径对「等」的容忍度不同:401 之后**阻
 ### ① 网关机(你信任的常驻机)
 
 ```bash
+# 先把设备端二进制编译好(darwin/linux × amd64/arm64,进 dist/device/<os>/<arch>)——
+# 网关经 SSH exec 把它发给设备,设备侧不需要装 Go
+make device-bins
+
 # 网关机上先 claude /login 登录你的订阅账号,凭证就位后直接跑 ——
 # 不配任何凭证时网关回退读 ~/.claude/.credentials.json(scopes 含 user:profile,/usage 才有数据)
 ./claude-credential-gateway
@@ -261,7 +279,7 @@ export CLAUDE_GATEWAY_UPSTREAM_CREDENTIALS=/var/lib/claude-gateway/.credentials.
 GATEWAY_HOST=你的网关 ./scripts/setup-device.sh laptop-1
 ```
 
-这一趟隧道会**故意失败**(公钥还没登记),脚本会把本机公钥打印出来。把公钥和 device-id
+这一趟**故意连不上网关的 SSH 层**(公钥还没登记),脚本会把本机公钥打印出来。把公钥和 device-id
 交给网关管理员,渠道随意 —— 公钥不是机密。
 
 ### ③ 管理员:在网关机上登记
@@ -283,9 +301,9 @@ GATEWAY_HOST=你的网关 GATEWAY_HOST_KEY_FP='SHA256:xxxx' \
   ./scripts/setup-device.sh laptop-1
 ```
 
-脚本会核对指纹(不符即中止)、建隧道、经隧道自取 CA 证书、经代理验证链路、检查 Claude Code 版本、
-写占位凭证,最后生成一个**包装命令** `~/.ccgw/bin/ccgw` —— 那一堆 `unset`/`export` 都收在里面,
-不用手敲:
+脚本会核对指纹(不符即中止)、经 SSH exec 取回分流代理二进制、拉起它(设备上唯一的常驻进程)、
+经它自取 CA 证书、经它验证整条链路、检查 Claude Code 版本、写占位凭证,最后生成一个**包装命令**
+`~/.ccgw/bin/ccgw` —— 那一堆 `unset`/`export` 都收在里面,不用手敲:
 
 ```bash
 export PATH="$HOME/.ccgw/bin:$PATH"    # 加进 ~/.zshrc 或 ~/.bashrc,一次即可
@@ -305,21 +323,31 @@ ccgw -p "写个快排"                      # 参数原样透传
 包装命令做的事(等价于手动设这些):
 
 ```bash
+# 分流代理没在跑就先拉起来
+curl -sf http://127.0.0.1:8788/status >/dev/null 2>&1 || ~/.ccgw/bin/ccgw-device start
+
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
 unset ANTHROPIC_UNIX_SOCKET CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR
 export HTTPS_PROXY=http://127.0.0.1:8788   HTTP_PROXY=http://127.0.0.1:8788
 export https_proxy=http://127.0.0.1:8788   http_proxy=http://127.0.0.1:8788
-# 本机地址必须排除,否则本地跑的 MCP server / dev server 也会被绕去网关
+# 本机地址必须排除,否则本地跑的 MCP server / dev server 也会被绕去分流代理
 export NO_PROXY=localhost,127.0.0.1,::1    no_proxy=localhost,127.0.0.1,::1
 export NODE_EXTRA_CA_CERTS=$HOME/.ccgw/ccgw_ca.crt
 export CLAUDE_CONFIG_DIR=$HOME/.ccgw/claude-home
 exec claude "$@"
 ```
 
-外加两个启动前自检:代理口连不上就提示「重跑 setup-device.sh 建隧道」,CA 缺失同理 ——
-比让 `claude` 抛一个含糊的连接错误好定位。
+外加一个启动前自检:CA 缺失就提示重跑 `setup-device.sh` —— 比让 `claude` 抛一个含糊的连接
+错误好定位。分流代理本身则用 `ccgw-device start|stop|status|log` 管理,不用记这几行:
 
-> 设备密钥与 CA 存 `~/.ccgw/`(不进仓库)。隧道断了重跑脚本即可,包装命令会一并重建。
+```bash
+ccgw-device status    # 在不在跑、网关链路通不通
+ccgw-device log       # 跟一下它的日志
+ccgw-device stop      # 手动停掉(平时不需要,ccgw 会在需要时自动拉起)
+```
+
+> 设备密钥与 CA 存 `~/.ccgw/`(不进仓库)。分流代理断了会在下次请求时自动重连;进程本身没了
+> (比如电脑重启过),下次跑 `ccgw` 会自动检测并拉起,或手动 `ccgw-device start`。
 >
 > **占位凭证不能省**:`claude` 自己要求手里有凭证才肯启动,什么都不设会停在
 > `Not logged in · Please run /login`。网关不校验它、只覆盖,所有设备填同一个假值即可。
@@ -349,58 +377,82 @@ exec claude "$@"
 > 详见 [docs/transport.md](docs/transport.md)。`MIN_CLAUDE_VERSION=x.y.z`
 > 可覆盖这个下限,`ALLOW_OLD_CLAUDE=1` 可强行放行(自担后果)。
 >
-> **设备的全部 HTTPS 流量都从网关出去**。遥测、WebFetch、MCP 也都走这条代理,没有绕开网关、
-> 从设备真实 IP 发出的旁路,所以不需要再去关非必要流量;放行范围由 `proxy.go` 里的盲转发名单决定。
+> **只有到 `api.anthropic.com` 的流量经过网关。** 分流代理按目标主机分流,遥测、WebFetch 抓的
+> 网页、npm、第三方 MCP server 都由分流代理直接从设备本机连出去,网关看不到、也管不着那部分
+> 流量 —— 网关的职责收窄成「凭证隔离 + 路径黑名单」,不是通用出口代理。
 
 ## 隧道口上跑的是什么
 
-设备侧只有**一个本地端口**(默认 `127.0.0.1:8788`),它同时当代理入口和取 CA 的明文口。网关按
-连接开头的字节自动分辨,不需要任何配置开关:
+设备侧只有**一个本地端口**(默认 `127.0.0.1:8788`),但它现在是分流代理(`ccgw-device`)
+自己的监听口,不是 SSH 转发出来的隧道口。`HTTPS_PROXY` 指向它,它按请求分两路:
+
+| 请求形态 | 命中 `--via-gateway`(默认只有 `api.anthropic.com`) | 其余主机 |
+|---|---|---|
+| `CONNECT host:443` | 分流代理开一个到网关的 direct-tcpip channel,把原始 CONNECT 请求行转发进去,由**网关**回 200 | 分流代理自己直接拨号、自己回 200 |
+| 绝对形式 HTTP(`GET http://host/path`) | 同上,经 SSH channel 转给网关 | 分流代理自己直连目标站 |
+| 相对路径(`GET /ca`、`GET /status`) | 转给网关自己 | 不适用 |
+
+命中网关的 CONNECT 有个细节:分流代理**不自己应答 200**,它把原始请求行照抄一遍发给网关,
+网关的 `200 Connection Established` 顺着这条连接原样传回客户端 —— 客户端验证的、之后握手的,
+始终是网关那次应答。之后两边纯字节对拷,分流代理不解密。
+
+命中网关的那部分流量,到了网关这一侧走的还是同一套协议:网关按连接开头的字节自动分辨,
+不需要任何配置开关:
 
 | 开头字节 | 当作什么 | 谁在用 |
 |---|---|---|
-| `CONNECT ` | HTTP 代理协议 | `HTTPS_PROXY` 指向它,claude 的全部 HTTPS 流量 |
-| `0x16` | 直接 TLS 握手 | TLS 记录的第一个字节 |
-| 其它 | 普通 HTTP | `GET /ca` 取 CA、`GET /status` 看限额 |
+| `CONNECT ` | HTTP 代理协议 | 分流代理转发的 CONNECT |
+| `0x16` | 直接 TLS 握手 | `ANTHROPIC_UNIX_SOCKET` 形态(未受此次改动影响) |
+| 其它 | 普通 HTTP | 分流代理转发的 `GET /ca`、`GET /status` |
 
-`CONNECT api.anthropic.com` 时,网关回 `200 Connection Established` 之后**就地终结 TLS**:
-它用自建 CA 现签一张 `api.anthropic.com` 证书,设备用 `NODE_EXTRA_CA_CERTS` 信任这把 CA 即可;
-解密出来的请求走正常的注入 + 转发流程。`CONNECT` 到盲转发名单里的主机则是纯 TCP 对拷,
-网关不解密也不注入。两处都不命中的,直接 403。
-
-明文 `http://` 走代理时是绝对形式请求(`GET http://host/path`),按同样的名单分流:
-`api.anthropic.com` 换上游并注入真凭证,盲转发名单里的原样转过去、**不注入**
-(WebFetch 抓 http 站点走这条),都不命中才 403。真凭证只会进 `api.anthropic.com`。
+`CONNECT api.anthropic.com` 到达网关后,网关回 `200 Connection Established` 之后**就地终结
+TLS**:它用自建 CA 现签一张 `api.anthropic.com` 证书,设备用 `NODE_EXTRA_CA_CERTS` 信任这把 CA
+即可;解密出来的请求走正常的注入 + 转发流程。其它主机网关压根看不到,直接由分流代理在设备本机
+处理掉了。
 
 限额快照两种拿法都行:
 
 ```bash
-curl http://127.0.0.1:8788/status                                   # 明文口
+curl http://127.0.0.1:8788/status                                   # 分流代理的本机口
 curl -x http://127.0.0.1:8788 --cacert ~/.ccgw/ccgw_ca.crt \
-     https://api.anthropic.com/status                               # 经代理,顺带验证整条链路
+     https://api.anthropic.com/status                               # 经分流代理 + 网关,顺带验证整条链路
 ```
 
-> `-L` 右边的目标(`127.0.0.1:8788`)必须在网关 `ssh.permit_targets` 里。它只是白名单口令,
-> 网关并不真监听这个地址;左边的本地端口随便改(`LOCAL_PROXY_PORT`)。
+> `--target`(默认 `127.0.0.1:8788`)必须在网关 `ssh.permit_targets` 里。它只是白名单口令,
+> 网关并不真监听这个地址;分流代理自己的本机监听端口(`--listen` / `LOCAL_PROXY_PORT`)随便改。
 
 ### 手动接入(不用脚本)
 
 ```bash
-# ① 设备本地生成密钥,把 .pub 交给管理员登记(见「快速开始」③)
+# ① 设备本地生成密钥,把 .pub 交给管理员登记(见「快速开始」③);known_hosts 按指纹手工核对后写入
 ssh-keygen -t ed25519 -f ~/.ccgw/ccgw_laptop-1 -N "" -C laptop-1
+ssh-keyscan -p 2222 -t ed25519 网关机 > /tmp/hk
+ssh-keygen -lf /tmp/hk   # 核对这个指纹和管理员给的一致,再写进 known_hosts
+awk '!/^#/ && NF>=3 {print "[网关机]:2222", $2, $3}' /tmp/hk > ~/.ccgw/known_hosts
 
-# ② 核对指纹后建隧道(一个转发就够,代理和取 CA 共用这个口)
-ssh -N -L 8788:127.0.0.1:8788 -p 2222 -i ~/.ccgw/ccgw_laptop-1 laptop-1@网关机 &
+# ② 经【网关的转发-only SSH 层】把分流代理二进制取下来 —— session 上只认这一条 exec
+ssh -p 2222 -i ~/.ccgw/ccgw_laptop-1 -o UserKnownHostsFile=~/.ccgw/known_hosts \
+    laptop-1@网关机 "device-binary darwin/arm64" > ~/.ccgw/bin/ccgw-device-bin
+chmod +x ~/.ccgw/bin/ccgw-device-bin
 
-# ③ 经【已认证的隧道】自取 CA —— 不需要、也不该有登录网关机的权限
+# ③ 跑起来:设备上唯一的常驻进程
+~/.ccgw/bin/ccgw-device-bin device \
+  --listen 127.0.0.1:8788 --gateway 网关机:2222 --device-id laptop-1 \
+  --key ~/.ccgw/ccgw_laptop-1 --known-hosts ~/.ccgw/known_hosts --target 127.0.0.1:8788 &
+
+# ④ 经【已认证的 SSH 连接】自取 CA —— 不需要、也不该有登录网关机的权限
 curl -s http://127.0.0.1:8788/ca -o ~/.ccgw/ccgw_ca.crt
 ```
 
-> CA 之所以能自取而 host key 指纹不能:建隧道时 SSH 已用 host key 认证了服务端身份,隧道内的
-> 字节可信;而指纹是这条信任链的**起点**,不能从还没建立的链里取。
+> CA 之所以能自取而 host key 指纹不能:分流代理连上网关时,SSH 已用 host key 认证了服务端
+> 身份,这条连接内的字节可信;而指纹是这条信任链的**起点**,不能从还没建立的链里取。
 >
-> `GET /ca` 走明文口是因为代理那一路要先验 TLS 证书,而证书正是要取的东西。明文口在 SSH
-> 隧道内,机密性和完整性由 SSH 保证。
+> `GET /ca` 转发给网关走的是相对路径那一路(见上表),不需要先验 `api.anthropic.com` 的
+> TLS 证书 —— 证书正是要取的东西。这条连接在 SSH 内,机密性和完整性由 SSH 保证。
+>
+> `device-binary <os>/<arch>` 是 SSH session channel 上唯一认得的命令,`<os>/<arch>` 须匹配
+> `dist/device/<os>/<arch>` 下已编译好的文件(`make device-bins` 产出);其它命令、以及任何
+> shell / pty / subsystem 请求都会被拒绝。
 
 ## 首次初始化:跳过交互式引导
 
@@ -506,9 +558,9 @@ time=06:39:33 level=INFO msg="已刷新上游凭证" detail="订阅 OAuth token 
   `setup-device.sh`(会更新 `known_hosts`)。
 - **CA 轮换**:删掉 `ccgw_ca_key`(含 `.crt`)重启自动生成 → 设备重跑脚本重新取 CA。
   旧 CA 还留在设备上的话,`ccgw` 会报证书错误。
-- **调整出口范围**:改 `proxy.go` 里的 `tunnelHosts` 重新编译、重启。名单默认只放行工具自身
-  要用的主机,所以放宽的场合更常见 —— WebFetch 抓名单外的站点、第三方 remote MCP server 都要
-  在这里加,它们的流量也从这条代理出去。
+- **升级分流代理**:改了 `device.go` 之类的代码后,网关侧 `make build device-bins` 重新编译、
+  重启网关;设备侧重跑 `setup-device.sh`(会经 SSH exec 重新取一份二进制、重启分流代理),
+  或手动 `ccgw-device stop` 后重跑取二进制的那步再 `ccgw-device start`。
 
 ## 安全与合规边界
 
@@ -522,12 +574,11 @@ time=06:39:33 level=INFO msg="已刷新上游凭证" detail="订阅 OAuth token 
   凭证隔离当场失效。所以登记设备由管理员在网关侧做,设备只会建隧道。
 - **CA 私钥比 host key 更敏感**:拿到 `ccgw_ca_key` 就能对任何信任该 CA 的设备伪造
   `api.anthropic.com`。它只该待在网关机上;分发给设备的 `.crt` 不是密钥。
-- **网关同时是设备的出口代理**。设备设了 `HTTPS_PROXY` 之后,claude 的全部 HTTPS 流量都从网关
-  出去,别人看到的是网关机的 IP,网关机也承担这部分流量。`proxy.go` 里的 `tunnelHosts` 是唯一
-  的闸门,只放行工具自身要用的主机;放宽它等于把网关往通用出口代理的方向推,所以这件事得改代码、
-  过评审。
+- **网关不是设备的出口代理。** 设备侧的分流代理只把 `api.anthropic.com` 送去网关,其余流量
+  从设备本机直连出去,网关看不到、也管不了那部分流量,不承担它的带宽和出口 IP。网关的职责
+  收窄成「凭证隔离 + 路径黑名单」,不是通用出口网关。
 - **真凭证只会送给 `api.anthropic.com`**,这条写死在代码里(`isMITMHost`),不是配置项 ——
-  换成别的域名就等于把订阅 token 交给那个域名。盲转发那条路不解密、也不会碰到凭证。
+  换成别的域名就等于把订阅 token 交给那个域名。设备直连的那些流量根本不经过网关,碰不到凭证。
 - **真凭证只走环境变量。** 别把 token 写进提交的文件;含明文 token 的本地启动脚本(如 `gateway.sh`)
   与本地 `config.yaml` 都已在 `.gitignore` 中。
 - **token 续期**:网关里只贴 access token 会几小时过期;稳妥做法是网关机器正常登录、由网关从

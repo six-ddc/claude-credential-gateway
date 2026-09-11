@@ -2,7 +2,7 @@
 //
 //   - 公钥认证:pubkey → device id,这是唯一的门禁;
 //   - 只接受 direct-tcpip / direct-streamlocal@openssh.com,且目标必须命中白名单;
-//   - session 类型一律 Reject → 无 shell / 无 exec / 无 pty(从结构上不存在);
+//   - session 只认一条 exec(device-binary <os>/<arch>,分发设备端二进制),无 shell / 无 pty;
 //   - 连接级与 channel 级请求全部丢弃 → 禁 -R 反向转发与其它扩展;
 //   - host key 不存在时首启自动生成(ed25519,0600),客户端靠 known_hosts pin 防 MITM;
 //   - authorized_keys 热重载:改 config.yaml 即生效,增删设备无需重启。
@@ -27,6 +27,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -208,7 +210,7 @@ const connectPrefix = "CONNECT "
 // 的那些塞回监听器。三种形态:
 //
 //	0x16        TLS handshake record —— 老的 ANTHROPIC_UNIX_SOCKET 形态,连上来直接握手;
-//	"CONNECT "  HTTP 代理形态(HTTPS_PROXY)—— 就地应答并按需 TLS 终结/盲转发;
+//	"CONNECT "  HTTP 代理形态(设备侧分流代理转来的)—— 只认 api.anthropic.com,就地应答并 TLS 终结;
 //	其余        明文 HTTP(取 CA、调试)。
 //
 // CONNECT 必须在这一层处理干净,不能丢给 http.Server 的 handler 去 Hijack:
@@ -332,6 +334,8 @@ type sshServer struct {
 	tunnels     *channelListener // 转发 channel 从这里流向进程内 HTTP Server
 	tlsConf     *tls.Config      // TLS 终结(ANTHROPIC_UNIX_SOCKET 形态)
 	ca          *certAuthority
+	// 设备端二进制目录(<dir>/<os>/<arch>),经 session channel 的 exec 分发给已认证设备。
+	deviceBinDir string
 }
 
 // permitted 判断客户端声明的转发目标是否在白名单内。
@@ -373,13 +377,14 @@ func newSSHServer(sc SSHConfig, reloadPath string) (*sshServer, error) {
 	}
 	conf.AddHostKey(signer)
 	return &sshServer{
-		conf:        conf,
-		addr:        sc.Addr,
-		permit:      parseForwardTargets(sc.PermitTargets),
-		fingerprint: ssh.FingerprintSHA256(signer.PublicKey()),
-		tunnels:     newChannelListener(),
-		tlsConf:     tlsConf,
-		ca:          ca,
+		conf:         conf,
+		addr:         sc.Addr,
+		permit:       parseForwardTargets(sc.PermitTargets),
+		fingerprint:  ssh.FingerprintSHA256(signer.PublicKey()),
+		tunnels:      newChannelListener(),
+		tlsConf:      tlsConf,
+		ca:           ca,
+		deviceBinDir: sc.DeviceBinDir,
 	}, nil
 }
 
@@ -448,11 +453,74 @@ func (s *sshServer) handleConn(nc net.Conn) {
 				continue
 			}
 			s.acceptForward(newCh, sc, device, p.Path)
+		case "session":
+			// 只为分发设备端二进制而存在,没有 shell / pty,见 handleSession。
+			s.handleSession(newCh, device)
 		default:
-			// session(shell/exec/pty)与其它一切 channel 都不存在。
 			newCh.Reject(ssh.Prohibited, "forwarding only")
 		}
 	}
+}
+
+// deviceBinaryCommand 是 session 上唯一认得的命令:`device-binary <os>/<arch>`。
+// 设备用系统自带的 ssh 就能把分流代理的二进制取下来,不需要别的分发渠道,
+// 也不需要给设备任何登录网关机的权限。
+const deviceBinaryCommand = "device-binary"
+
+var devicePlatform = regexp.MustCompile(`^[a-z0-9]+/[a-z0-9]+$`)
+
+// handleSession 接受一个 session channel,只回应一次 exec;shell、pty、subsystem 一律拒绝。
+func (s *sshServer) handleSession(newCh ssh.NewChannel, device string) {
+	ch, reqs, err := newCh.Accept()
+	if err != nil {
+		return
+	}
+	go func() {
+		defer ch.Close()
+		for req := range reqs {
+			switch req.Type {
+			case "exec":
+				var p struct{ Command string }
+				if err := ssh.Unmarshal(req.Payload, &p); err != nil {
+					req.Reply(false, nil)
+					return
+				}
+				req.Reply(true, nil)
+				status := s.execCommand(ch, device, p.Command)
+				ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+				return
+			case "env":
+				req.Reply(true, nil) // 客户端 SendEnv 带来的,收下不用
+			default:
+				req.Reply(false, nil)
+			}
+		}
+	}()
+}
+
+// execCommand 执行 session 上的命令,返回退出码。
+func (s *sshServer) execCommand(ch ssh.Channel, device, command string) uint32 {
+	fields := strings.Fields(command)
+	if len(fields) != 2 || fields[0] != deviceBinaryCommand || !devicePlatform.MatchString(fields[1]) {
+		events.Warn("ssh exec denied", "user", device, "command", command)
+		fmt.Fprintf(ch.Stderr(), "unknown command %q; only: %s <os>/<arch>\n", command, deviceBinaryCommand)
+		return 1
+	}
+	path := filepath.Join(s.deviceBinDir, filepath.FromSlash(fields[1]))
+	f, err := os.Open(path)
+	if err != nil {
+		events.Warn("device binary missing", "user", device, "platform", fields[1], "path", path)
+		fmt.Fprintf(ch.Stderr(), "no device binary for %s on the gateway (expected %s; run `make device-bins`)\n", fields[1], path)
+		return 1
+	}
+	defer f.Close()
+	n, err := io.Copy(ch, f)
+	if err != nil {
+		events.Warn("device binary send failed", "user", device, "platform", fields[1], "err", err)
+		return 1
+	}
+	events.Info("device binary served", "user", device, "platform", fields[1], "bytes", n)
+	return 0
 }
 
 func (s *sshServer) rejectTarget(newCh ssh.NewChannel, device, target string) {

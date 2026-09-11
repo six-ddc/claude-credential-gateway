@@ -144,10 +144,19 @@ func TestUnauthorizedKeyRejected(t *testing.T) {
 	}
 }
 
-// session channel(shell/exec/pty)→ Reject。
-func TestSessionRejected(t *testing.T) {
+// session channel 只为 `device-binary <os>/<arch>` 存在:shell / pty 拒绝,别的命令退出码非 0。
+func TestSessionOnlyServesDeviceBinary(t *testing.T) {
 	signer, pub := genClientKey(t)
-	addr, _ := startSSHServer(t, "127.0.0.1:8788", []AuthorizedKey{{ID: "laptop-1", Key: pub}})
+	s := newTestSSHServer(t, []string{"127.0.0.1:8788"}, []AuthorizedKey{{ID: "laptop-1", Key: pub}})
+	s.deviceBinDir = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(s.deviceBinDir, "darwin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("#!/bin/sh\necho fake device binary\n")
+	if err := os.WriteFile(filepath.Join(s.deviceBinDir, "darwin", "arm64"), want, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	addr := listen(t, s)
 
 	client, err := dialSSH(addr, signer)
 	if err != nil {
@@ -155,9 +164,41 @@ func TestSessionRejected(t *testing.T) {
 	}
 	defer client.Close()
 
-	if sess, err := client.NewSession(); err == nil {
+	// shell / pty 不存在
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("session channel 应被接受(用于分发二进制): %v", err)
+	}
+	if err := sess.RequestPty("xterm", 24, 80, nil); err == nil {
+		t.Fatal("pty 应被拒绝")
+	}
+	if err := sess.Shell(); err == nil {
+		t.Fatal("shell 应被拒绝")
+	}
+	sess.Close()
+
+	// 正确的命令:原样拿到文件
+	sess, _ = client.NewSession()
+	got, err := sess.Output("device-binary darwin/arm64")
+	sess.Close()
+	if err != nil {
+		t.Fatalf("device-binary 应成功: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("应原样拿到二进制,实际 %q", got)
+	}
+
+	// 没有的平台、别的命令:退出码非 0,不泄漏任何东西
+	for _, cmd := range []string{"device-binary plan9/mips", "ls /", "device-binary ../../etc/passwd"} {
+		sess, _ = client.NewSession()
+		out, err := sess.Output(cmd)
 		sess.Close()
-		t.Fatal("session channel 应被拒绝")
+		if err == nil {
+			t.Fatalf("%q 应失败", cmd)
+		}
+		if len(out) != 0 {
+			t.Fatalf("%q 不该有 stdout 输出,实际 %q", cmd, out)
+		}
 	}
 }
 
