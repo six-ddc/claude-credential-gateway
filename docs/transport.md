@@ -14,15 +14,17 @@
 ## 0. 一句话结论
 
 设备侧把 `HTTPS_PROXY` 指向本机的分流代理(`ccgw-device`),不是直接指向网关。Claude Code
-于是对**每一个** HTTPS 目标先发 `CONNECT <host>:443`,分流代理按目标主机分两路:命中
-`--via-gateway`(默认只有 `api.anthropic.com`)的,经它自己维护的 SSH 连接转给网关,由网关
-就地终结 TLS、把 `Authorization` 换成真凭证再转发;其余主机分流代理自己直接拨号,纯字节
-对拷,网关完全看不见。因为要解密,网关必须拿一张客户端认可的 `api.anthropic.com` 证书 ——
-自建 CA 现签,设备用 `NODE_EXTRA_CA_CERTS` 信任那把 CA。
+于是对**每一个** HTTPS 目标先发 `CONNECT <host>:443`,分流代理按目标主机分两路:命中它内置的
+名单(`api.anthropic.com` + `tunnelHosts`,和网关同一份,即全部 Claude 相关主机)的,
+经它自己维护的 SSH 连接转给网关,由网关按主机分别处理 —— `api.anthropic.com` 就地终结 TLS、
+把 `Authorization` 换成真凭证再转发,`tunnelHosts` 里的主机纯字节盲转发、不解密不碰凭证;
+名单外的主机分流代理自己直接拨号,纯字节对拷,网关完全看不见。因为要给 `api.anthropic.com`
+解密,网关必须拿一张客户端认可的 `api.anthropic.com` 证书 —— 自建 CA 现签,设备用
+`NODE_EXTRA_CA_CERTS` 信任那把 CA。
 
 选代理而不选 unix socket,不是口味问题:**unix socket 在客户端里根本覆盖不了全部流量**
 (第 1 节)。选设备侧分流、而不是把设备全部流量都送进网关再由网关放行,也不是口味问题:
-**环境变量形态的代理没法只挑一个主机走网关、其余直连**(第 7 节)。
+**环境变量形态的代理没法只挑一份主机名单走网关、其余直连**(第 7 节)。
 
 ---
 
@@ -164,7 +166,7 @@ CN/SAN 都是 `forgedHost = "api.anthropic.com"`,另带 `localhost` 和回环 IP
 `serverTLSConfig()` 只报 `http/1.1`(`tlsterm.go:198-199`):网关这侧是 HTTP/1.1 server,不让客户端谈成 h2。
 
 一个实现细节:客户端可能不等 200 就把 ClientHello 贴着 CONNECT 一起发出去,那几个字节已经落进
-`bufio.Reader`。`handleConnect` 用 `replayBuffered` 把它们接回连接头部(`proxy.go:104`),
+`bufio.Reader`。`handleConnect` 用 `replayBuffered` 把它们接回连接头部(`proxy.go:175`),
 否则握手会缺开头字节。
 
 ---
@@ -194,7 +196,7 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
 
 所以 CONNECT 在 `serveTunnelConn`(`sshfwd.go:212`)里就地读、就地应答,压根不进 `http.Server`。
 `main.go` 的 handler 里留了一道兜底:真收到 CONNECT 就回 501 明说「这应该在隧道层处理掉」
-(`main.go:162-164`),分派逻辑漏了要吵出来,而不是默默当普通请求转出去。
+(`main.go:173-176`),分派逻辑漏了要吵出来,而不是默默当普通请求转出去。
 
 ---
 
@@ -215,31 +217,36 @@ deadline 打不断预读,预读就一直挂着,`Hijack()` 就一直等 —— �
 发的就是普通明文 HTTP,不是 CONNECT。网关按开头字节自己分得清,分流代理不需要给这类请求另开
 一条协议。
 
-### 5.2 CONNECT 之后只认一个主机
+### 5.2 CONNECT 之后按两种方式放行
 
-`handleConnect`(`proxy.go:93-114`)拿 CONNECT 的目标主机名比对:
+`handleConnect`(`proxy.go:155-186`)拿 CONNECT 的目标主机名比对,放行不是「白名单 vs 黑名单」
+而是「两种不同的处理办法」:
 
-- 命中 `isMITMHost`(`proxy.go:36`,也就是 `forgedHost = "api.anthropic.com"`,大小写不敏感)
+- 命中 `isMITMHost`(`proxy.go:66`,也就是 `forgedHost = "api.anthropic.com"`,大小写不敏感)
   → 回 200,就地 TLS 终结,解密出的请求塞回 HTTP Server,走正常的注入 + 转发;
-- 不命中 → 403。
+- 命中 `tunnelHosts`(`proxy.go:40-57`)→ 回 200,纯 TCP 对拷,不解密、也不碰凭证;
+- 两种都不命中 → 403。
 
-**这条判断写死在代码里,不是配置项。**「真凭证送给谁」不该是部署时随手能改的东西,要换成
-别的主机就得改 `proxy.go` 重新编译,让它进代码评审。
+**这两份名单都写死在代码里,不是配置项。**「真凭证送给谁」和「哪些 Claude 相关主机经网关」都
+不该是部署时随手能改的东西,要放行别的主机就得改 `proxy.go` 重新编译,让它进代码评审。
 
-客户端无论上游配到哪儿,URL 里的主机名始终是 `api.anthropic.com`,一个就够;多放一个域名就
-等于把真凭证送到那儿去。官方表里挂在这个域下的「WebFetch 域名安全检查、特性开关拉取、遥测事件
-上报」因此走的都是注入路径 —— 遥测是通的,并没有被关掉。
+客户端无论上游配到哪儿,URL 里的主机名始终是 `api.anthropic.com`,解密注入只认它一个就够;
+多放一个域名就等于把真凭证送到那儿去。官方表里挂在这个域下的「WebFetch 域名安全检查、特性开关
+拉取、遥测事件上报」因此走的都是注入路径 —— 遥测是通的,并没有被关掉。
 
-**其它一切主机都不该到达这一层。** 官方《Enterprise network configuration》列出的「Claude
-Code 需要访问的 URL」里,除 `api.anthropic.com` 外还有一批:账号认证、OAuth token 交换、
-插件下载、包源、MCP connector、Datadog 遥测。这些主机的流量由设备侧的分流代理(第 7 节)
-直接从设备本机连出去,根本不会到网关这一层——网关连这部分流量的存在都不知道。到达网关这一层、
-又没命中 `api.anthropic.com` 的 CONNECT,只可能是分流代理的 `--via-gateway` 配错了,或者有人
-把 `HTTPS_PROXY` 直接指到了网关的隧道口(而不是经分流代理)——两种情况都该 403。
+`tunnelHosts` 装的是账号认证、文档查询、包源、MCP connector、Datadog 遥测这批「Claude 相关但
+不需要真凭证」的主机,内容对齐官方《Enterprise network configuration》列出的「Claude Code
+需要访问的 URL」,详见 [README「代理放行哪些主机」](../README.md#代理放行哪些主机)。设备侧
+分流代理(第 7 节)内置同一份名单(`gatewayHosts()`,`device.go:91-93`),把 `api.anthropic.com`
+加 `tunnelHosts` 一起送来网关;名单外的主机(WebFetch 抓的任意网站、第三方 MCP server、
+`github.com` 之类)由分流代理直接从设备本机连出去,根本到不了网关这一层。
 
-网关启动时把这条打出来(`main.go:131`),不用翻源码就知道放行了谁。被拒的 CONNECT 回的是带
-缘由的 403(`writeConnectDenied`,`proxy.go:119-126`):body 是 JSON,带被拒的主机名和「去跑
-设备侧分流代理」的提示。客户端那头只看得到代理的状态码,不这么写排查时只剩一个光秃秃的 403。
+网关启动时把两份名单都打出来(`main.go:131-132`),不用翻源码就知道放行了谁。被拒的 CONNECT
+回的是带缘由的 403(`writeConnectDenied`,`proxy.go:191-198`):body 是 JSON,带被拒的主机名
+和「把它加进 `proxy.go` 的 `tunnelHosts` 重新部署网关」的提示。客户端那头只看得到代理的状态码,
+不这么写排查时只剩一个光秃秃的 403。到达网关这一层、两份名单都没命中的 CONNECT,只可能是设备
+上的分流代理二进制版本落后于网关(内置名单没跟上 `tunnelHosts` 的改动),或者有人把
+`HTTPS_PROXY` 直接指到了网关的隧道口(而不是经分流代理)——两种情况都该 403。
 
 ### 5.3 注入与透传
 
@@ -252,10 +259,11 @@ Code 需要访问的 URL」里,除 `api.anthropic.com` 外还有一批:账号认
 - **剥掉客户端的凭证企图**(`main.go:52-65`)。`x-api-key` 必剥:设备上残留的 `ANTHROPIC_API_KEY` 会让
   客户端改发这个头,它优先级高于 `Authorization`,不剥就是上游拿假 key 校验后 401。
   `proxy-authorization` 也剥 —— 那是客户端发给**代理**的,不该转给上游。
-- **明文 HTTP 按同一条规则处理**(`main.go:192-196`)。经代理的明文请求是绝对形式
-  (`GET http://host/path`):`api.anthropic.com` 换上游并注入真凭证,其它主机一律 403。
-  这条路径正常情况下只会收到分流代理转发过来的 `api.anthropic.com` 请求 —— 其它主机的明文
-  HTTP 分流代理自己直连处理掉了,根本不会送到网关这儿。
+- **明文 HTTP 按同一条规则处理**(`main.go:196-204`)。经代理的明文请求是绝对形式
+  (`GET http://host/path`):`api.anthropic.com` 换上游并注入真凭证;`tunnelHosts` 里的主机
+  原样转发,不解密、不注入;两者都不是 → 403。这条路径既会收到分流代理转发来的
+  `api.anthropic.com` 请求,也会收到 `tunnelHosts` 里主机的请求(比如 WebFetch 抓 HTTP
+  站点)—— 名单外主机的明文 HTTP,分流代理自己直连处理掉了,根本不会送到网关这儿。
 
 ---
 
@@ -347,37 +355,38 @@ Claude Code 认的环境变量只有 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` 这�
 - `NO_PROXY` 只能列一份「排除列表」,没有取反语法,说不出「除了这一个主机,其它一律排除」。
   而 WebFetch、第三方 MCP server 能连的主机理论上是任意的,没法穷举出一份完整的排除列表。
 - 就算能穷举,方向也是反的:命中 `NO_PROXY` 的主机会**绕开代理直连**,这正是我们想要给
-  非 `api.anthropic.com` 的流量;但穷举不到、没写进 `NO_PROXY` 的主机会落进 `HTTPS_PROXY`,
-  也就是继续送去网关 —— 跟「只有 `api.anthropic.com` 经网关」这个目标正好相反。
+  名单外的流量;但穷举不到、没写进 `NO_PROXY` 的主机会落进 `HTTPS_PROXY`,也就是继续送去
+  网关 —— 跟「只有 `api.anthropic.com` 加 `tunnelHosts` 经网关」这个目标正好相反。
 - 浏览器可以用 PAC 脚本按主机名写任意路由逻辑,但 Node/undici 的 `EnvHttpProxyAgent`
   不读 PAC,只认那三个环境变量,没有「按主机分流到不同代理」这个概念。
 
-所以要把「一个主机经网关、其余直连」这条规则真正落地,只能在设备本机跑一个会自己判断目标
+所以要把「一份主机名单经网关、其余直连」这条规则真正落地,只能在设备本机跑一个会自己判断目标
 主机的正向代理 —— 这就是 `device.go` 里的 `splitProxy`,`HTTPS_PROXY` 指向它,不是指向网关。
 
 ### 7.2 路由规则
 
-分流代理监听 `--listen`(默认 `127.0.0.1:8788`),对每个请求判断目标主机是否在 `--via-gateway`
-里(默认只有 `api.anthropic.com`,逗号分隔可加多个):
+分流代理监听 `--listen`(默认 `127.0.0.1:8788`),对每个请求判断目标主机是否在内置名单
+`gatewayHosts()`(`device.go:91-93`,= `api.anthropic.com` + `tunnelHosts`,即全部 Claude 相关
+主机,和网关同一份、不是命令行参数)里:
 
-| 请求 | 命中 `--via-gateway` | 其余主机 |
+| 请求 | 命中内置名单 | 其余主机 |
 |---|---|---|
-| `CONNECT host:443` | `connect()`(`device.go:305-335`):开一个到网关的 SSH channel,把原始 CONNECT 请求行转发进去,网关的 200 顺着这条连接原样传回客户端 | 自己 `net.DialTimeout` 直连,自己回 200(`connectEstablished`) |
+| `CONNECT host:443` | `connect()`(`device.go:323-353`):开一个到网关的 SSH channel,把原始 CONNECT 请求行转发进去,网关的 200 顺着这条连接原样传回客户端 | 自己 `net.DialTimeout` 直连,自己回 200(`connectEstablished`) |
 | 绝对形式 HTTP | 走 `viaHTTP` transport(每次请求单独开一条 channel,`DisableKeepAlives`) | 走 `directHTTP` transport(普通 `net.Dialer`) |
 | 相对路径(`/ca`、`/status`) | 改写成 `http://gateway/...`,同样走 `viaHTTP` | 不适用,这类请求本就没有主机 |
 
-两条 transport 在 `newSplitProxy`(`device.go:242-259`)里装好:`viaHTTP` 的 `DialContext`
+两条 transport 在 `newSplitProxy`(`device.go:251-278`)里装好:`viaHTTP` 的 `DialContext`
 直接调 `tunnel.Dial()`;`directHTTP` 的 `Proxy` 显式设成 `nil` —— 避免它又去读一遍
 `HTTPS_PROXY`,把自己绕回自己形成死循环。
 
 拨不通(目标直连失败,或网关 SSH 链路暂时不可用)统一回 502,body 是 JSON:
 `{"error":"upstream unreachable","host":"...","cause":"..."}`(`writeBadGateway`,
-`device.go:372-378`)。网关链路的故障只影响经网关那一路 —— 直连主机的请求不受影响,
+`device.go:393-398`)。网关链路的故障只影响经网关那一路 —— 直连主机的请求不受影响,
 这是分流本身带来的副作用之一,顺带做到了故障隔离。
 
 ### 7.3 分流代理和网关之间的 SSH 连接
 
-分流代理自己维护一条到网关的 SSH 连接(`sshLink`,`device.go:94-230`),行为对齐官方
+分流代理自己维护一条到网关的 SSH 连接(`sshLink`,`device.go:100-238`),行为对齐官方
 `claude ssh` 那条 `ssh -L` 隧道,只是从「客户端每次自己起一条」变成「设备侧常驻组件自己管理」:
 
 - **认证**:公钥(`--key`),跟接入脚本生成、管理员登记的是同一把;
@@ -385,12 +394,12 @@ Claude Code 认的环境变量只有 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` 这�
   `StrictHostKeyChecking=yes`,不在 `known_hosts` 里或不符都直接拒绝连接;
 - **保活**:每 `--keepalive`(默认 `30s`)发一次 `keepalive@openssh.com`,连续
   `--keepalive-max`(默认 `3`)次无应答就判定链路已死、主动断开(`keepAlive`,
-  `device.go:202-230`)—— 目的是尽早发现「连接其实已经死了」,不是把它救回来:
+  `device.go:210-238`)—— 目的是尽早发现「连接其实已经死了」,不是把它救回来:
   笔记本合盖唤醒之后 TCP 早就断了,不主动探测就得等内核超时才知道;
 - **重连**:死连接不会让分流代理本身退出。下一个要经网关的请求会触发按需重拨(`connect`,
-  `device.go:158-188`),失败按指数退避 `1s → 30s`(`sshBackoffMin`/`sshBackoffMax`),
+  `device.go:166-196`),失败按指数退避 `1s → 30s`(`sshBackoffMin`/`sshBackoffMax`),
   退避期内直接报错,不用每个请求都去撞一次拨号超时;
-- **启动时机**:进程起来就先主动拨一次(`runDevice`,`device.go:80-84`),连不上只告警、
+- **启动时机**:进程起来就先主动拨一次(`runDevice`,`device.go:82-85`),连不上只告警、
   照常监听 —— 这样接入脚本立刻能知道链路通不通,而不是等第一个请求才发现。
 
 分流代理开的每一条 channel 都是 `direct-tcpip`,目标是 `--target`(默认 `127.0.0.1:8788`),
@@ -433,11 +442,12 @@ Claude Code 认的环境变量只有 `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` 这�
 | env token 分支硬编码 scopes | 客户端 `utils/auth.ts:1255-1272`(`1266`)、`1402-1408` |
 | 凭证文件路径 / keychain service name | 客户端 `utils/envUtils.ts:7-14`、`utils/secureStorage/plainTextStorage.ts:13-17`、`macOsKeychainHelpers.ts:27-41`、`index.ts:9-17` |
 | 代理 / CA / mTLS 的官方支持说明 | 《Enterprise network configuration》 |
-| CONNECT 处理、单主机注入判断 | `proxy.go`(`handleConnect` 在 `93`,`isMITMHost` 在 `36`) |
+| CONNECT 处理、两种放行方式判断 | `proxy.go`(`handleConnect` 在 `155`,`isMITMHost` 在 `66`,`tunnelHosts` 在 `40-57`) |
 | 首字节分派、deadline no-op 与 Hijack 陷阱 | `sshfwd.go:182-184`、`201-241` |
 | TLS 终结、自建 CA、伪造叶证书 | `tlsterm.go`(`forgedHost` 在 `44`) |
-| 凭证注入、剥头、path 透传 | `main.go:52-65`、`155-320` |
-| 唯一放行的注入主机(启动时打印在 `main.go:131`) | `proxy.go:36` |
-| 路径黑名单 `blockedPaths`(启动时打印在 `main.go:132`) | `proxy.go:50-66` |
-| 设备侧分流代理:路由、SSH 连接、退避重连 | `device.go`(`splitProxy` 在 `233`,`sshLink` 在 `94`) |
+| 凭证注入、剥头、path 透传 | `main.go:52-65`、`156-345` |
+| 解密注入的唯一主机(启动时打印在 `main.go:131`) | `proxy.go:66`(`isMITMHost`) |
+| 盲转发名单 `tunnelHosts`(启动时打印在 `main.go:132`) | `proxy.go:40-57` |
+| 路径黑名单 `blockedPaths`(启动时打印在 `main.go:133`) | `proxy.go:80-85` |
+| 设备侧分流代理:路由、SSH 连接、退避重连 | `device.go`(`splitProxy` 在 `241`,`sshLink` 在 `100`,`gatewayHosts` 在 `91-93`) |
 | 设备端二进制分发(session exec) | `sshfwd.go:465-524`;编译产出见 `Makefile` |

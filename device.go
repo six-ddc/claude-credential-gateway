@@ -1,13 +1,15 @@
 // device.go 是设备侧的分流代理(子命令 `device`):Claude Code 的 HTTPS_PROXY 指向它,
 // 它按主机把流量分成两路 ——
 //
-//   - 命中 --via-gateway(默认只有 api.anthropic.com)的 CONNECT,经它自己维护的 SSH 连接
-//     转给网关,由网关 TLS 终结并注入真凭证;
-//   - 其余主机由它直接拨号,纯字节对拷。WebFetch 抓的网站、npm 包源、第三方 MCP server、
-//     遥测上报都从设备本机出去,网关不再当出口代理。
+//   - Claude 相关主机(api.anthropic.com + proxy.go 的 tunnelHosts,和网关同一份名单),
+//     CONNECT 经它自己维护的 SSH 连接原样转给网关:api.anthropic.com 由网关 TLS 终结并
+//     注入真凭证,其余由网关盲转发;
+//   - 名单外的主机由它直接拨号,纯字节对拷。WebFetch 抓的网站、第三方 MCP server、
+//     git/gh 这些从设备本机出去,不到网关。
 //
-// 明文 HTTP 同样分流;不带主机的相对路径请求(GET /ca、GET /status)一律转给网关,
-// 接入脚本和包装命令靠它取 CA、探活。
+// 明文 HTTP 同样分流:经网关的以绝对形式(GET http://host/path)交给网关按同一份名单处理;
+// 不带主机的相对路径请求(GET /ca、GET /status)是发给网关自己的,接入脚本和包装命令靠它
+// 取 CA、探活。
 //
 // SSH 连接是内建的:公钥认证、known_hosts 严格校验、定时 keepalive、断了按需重拨。
 // 设备上只需要这一个常驻进程。
@@ -22,6 +24,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -41,7 +44,6 @@ func runDevice(args []string) error {
 	keyPath := fs.String("key", "", "设备私钥路径(必填)")
 	knownHostsPath := fs.String("known-hosts", "", "已核对过的网关 host key(必填)")
 	target := fs.String("target", "127.0.0.1:8788", "SSH 转发目标,须在网关 permit_targets 里")
-	via := fs.String("via-gateway", forgedHost, "经网关的主机名,逗号分隔;其余主机直连")
 	keepalive := fs.Duration("keepalive", 30*time.Second, "SSH keepalive 间隔")
 	keepaliveMax := fs.Int("keepalive-max", 3, "连续几次 keepalive 无应答就判定链路已死")
 	pidfile := fs.String("pidfile", "", "把自己的 pid 写到这个文件,便于脚本停掉旧进程")
@@ -61,7 +63,7 @@ func runDevice(args []string) error {
 	if err != nil {
 		return err
 	}
-	p := newSplitProxy(link, strings.Split(*via, ","))
+	p := newSplitProxy(link, gatewayHosts())
 	p.verbose = *verbose
 
 	ln, err := net.Listen("tcp", *listen)
@@ -76,12 +78,18 @@ func runDevice(args []string) error {
 
 	log.Printf("分流代理监听 %s", *listen)
 	log.Printf("经网关 %s(SSH %s,设备 %s): %s", *gateway, *target, *deviceID, strings.Join(p.viaList(), ", "))
-	log.Printf("其余主机由本机直连")
+	log.Printf("名单外的主机由本机直连")
 	// 先拨一次,让接入脚本立刻知道链路通不通;拨不通也照常监听,之后按需重试。
 	if _, err := link.connect(); err != nil {
 		log.Printf("⚠ 网关暂时连不上: %v(会在有请求时重试)", err)
 	}
 	return p.serve(ln)
+}
+
+// gatewayHosts 是要送去网关的主机:注入主机加上网关盲转发的那份名单。
+// 和网关是同一个二进制、同一个切片,两边不会对不上,所以不做成参数。
+func gatewayHosts() []string {
+	return append([]string{forgedHost}, tunnelHosts...)
 }
 
 // tunnelDialer 打开一条到网关的连接。生产实现是 sshLink;测试里换成直连假网关。
@@ -235,8 +243,9 @@ type splitProxy struct {
 	via     map[string]bool
 	verbose bool
 
-	viaHTTP    http.RoundTripper // 明文 HTTP → 网关(经隧道)
-	directHTTP http.RoundTripper // 明文 HTTP → 目标站直连
+	gatewayHTTP http.RoundTripper // 相对路径的明文请求 → 网关自己(GET /ca、/status)
+	viaHTTP     http.RoundTripper // 经网关主机的明文请求 → 以绝对形式交给网关转发
+	directHTTP  http.RoundTripper // 名单外主机的明文请求 → 目标站直连
 }
 
 func newSplitProxy(tunnel tunnelDialer, via []string) *splitProxy {
@@ -246,9 +255,18 @@ func newSplitProxy(tunnel tunnelDialer, via []string) *splitProxy {
 			p.via[h] = true
 		}
 	}
-	p.viaHTTP = &http.Transport{
-		DialContext:       func(context.Context, string, string) (net.Conn, error) { return tunnel.Dial() },
+	tunnelDial := func(context.Context, string, string) (net.Conn, error) { return tunnel.Dial() }
+	p.gatewayHTTP = &http.Transport{
+		DialContext:       tunnelDial,
 		DisableKeepAlives: true, // 每个请求一条 channel,不和连接复用的键(主机名)纠缠
+	}
+	// 装成「网关是我的上游代理」:Transport 会把请求写成绝对形式 GET http://host/path,
+	// 网关据此按主机名分流(注入主机换上游+注入;盲转发名单里的原样转过去)。
+	gatewayAsProxy, _ := url.Parse("http://gateway")
+	p.viaHTTP = &http.Transport{
+		Proxy:             http.ProxyURL(gatewayAsProxy),
+		DialContext:       tunnelDial,
+		DisableKeepAlives: true,
 	}
 	p.directHTTP = &http.Transport{
 		Proxy:             nil, // 自己就是代理,绝不能再读 HTTPS_PROXY 绕回自己
@@ -300,8 +318,8 @@ func (p *splitProxy) handle(c net.Conn) {
 	}
 }
 
-// connect 处理 CONNECT:命中 --via-gateway 的把原始 CONNECT 转给网关,由网关应答;
-// 其余主机自己拨号、自己回 200。之后两边纯字节对拷。
+// connect 处理 CONNECT:Claude 相关主机的把原始 CONNECT 转给网关,由网关应答
+// (注入主机 TLS 终结,其余盲转发);名单外的主机自己拨号、自己回 200。之后两边纯字节对拷。
 func (p *splitProxy) connect(c net.Conn, br *bufio.Reader, req *http.Request) {
 	target := req.Host
 	if target == "" {
@@ -336,13 +354,15 @@ func (p *splitProxy) connect(c net.Conn, br *bufio.Reader, req *http.Request) {
 
 // plain 处理一个明文 HTTP 请求并把响应写回。返回 false 表示这条连接不该再复用。
 func (p *splitProxy) plain(c net.Conn, req *http.Request) bool {
-	rt := p.viaHTTP
-	route := "gateway"
+	var rt http.RoundTripper
+	var route string
 	switch {
 	case !req.URL.IsAbs():
-		// 相对路径(GET /ca、GET /status)是发给网关自己的。
+		// 相对路径(GET /ca、GET /status)是发给网关自己的,保持相对形式。
 		req.URL.Scheme, req.URL.Host = "http", "gateway"
+		rt, route = p.gatewayHTTP, "gateway-self"
 	case p.viaGateway(req.URL.Hostname()):
+		rt, route = p.viaHTTP, "gateway"
 	default:
 		rt, route = p.directHTTP, "direct"
 	}

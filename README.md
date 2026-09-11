@@ -17,32 +17,38 @@
   ▼
 设备侧分流代理(:8788,唯一常驻进程)—— 按 CONNECT/请求的目标主机分两路
   │
-  ├─ api.anthropic.com ──▶ 经它自己维护的 SSH 连接(公钥认证,known_hosts pin,断了按需重拨)
-  │                          │
-  │                          ▼
-  │                   转发-only SSH 层(:2222,网关唯一对外端口)
-  │                    · 公钥 → device id,这是唯一门禁
-  │                    · 只接受白名单内的转发目标
-  │                    · session 只认一条 exec:发设备端二进制,无 shell / 无 pty
-  │                    · 禁 -R 反向转发,host key pin 防 MITM
-  │                          │
-  │                          ▼
-  │                   进程内网关(转发 channel 直连,不监听任何 HTTP 端口)
-  │                    · CONNECT api.anthropic.com → 就地 TLS 终结 → 剥掉客户端凭证、注入真订阅 token
-  │                    · 路径黑名单(Artifact、Remote Control)按 path 拦
-  │                    · per-device 审计 + 5h/7d 限额被动采样
-  │                          │
-  │                          ▼
-  │                   api.anthropic.com(注入真凭证)
+  ├─ Claude 相关主机(内置名单 = api.anthropic.com + tunnelHosts,和网关同一份)
+  │    ──▶ 经它自己维护的 SSH 连接(公钥认证,known_hosts pin,断了按需重拨)
+  │           │
+  │           ▼
+  │    转发-only SSH 层(:2222,网关唯一对外端口)
+  │     · 公钥 → device id,这是唯一门禁
+  │     · 只接受白名单内的转发目标
+  │     · session 只认一条 exec:发设备端二进制,无 shell / 无 pty
+  │     · 禁 -R 反向转发,host key pin 防 MITM
+  │           │
+  │           ▼
+  │    进程内网关(转发 channel 直连,不监听任何 HTTP 端口)
+  │     · CONNECT api.anthropic.com    → 就地 TLS 终结 → 剥掉客户端凭证、注入真订阅 token
+  │     · CONNECT tunnelHosts 里的主机 → 纯字节盲转发,不解密、不碰凭证
+  │     · 路径黑名单(Artifact、Remote Control)按 path 拦(只挡注入路径)
+  │     · per-device 审计 + 5h/7d 限额被动采样
+  │           │
+  │     ┌─────┴───────────────────────────────┐
+  │     ▼                                     ▼
+  │  api.anthropic.com(注入真凭证)    claude.ai / platform.claude.com / npm /
+  │                                   mcp-proxy / Datadog ……(盲转发)
   │
-  └─ 其它主机(WebFetch 抓的网站、npm、第三方 MCP server、遥测……)
+  └─ 名单外的主机(WebFetch 抓的网站、第三方 MCP server、github.com……)
        ──▶ 分流代理自己直连,纯字节对拷,网关完全看不见
 ```
 
 几个要点:
 
-- **设备上只有一个常驻进程**:分流代理 `ccgw-device`。`HTTPS_PROXY` 指向它,它按目标主机分流,
-  只把 `api.anthropic.com` 送去网关,其余流量直接从设备本机出去 —— 网关不再是设备的出口代理。
+- **设备上只有一个常驻进程**:分流代理 `ccgw-device`。`HTTPS_PROXY` 指向它,它按目标主机分流:
+  分流代理内置的名单(`api.anthropic.com` 加 `tunnelHosts`,和网关同一份,即全部 Claude 相关
+  主机)送去网关,由网关按主机分别处理(解密注入 / 盲转发);名单外的主机(WebFetch 抓的网站、
+  第三方 MCP server、`github.com` 之类)由设备本机直接连出去,不到网关。
 - **网关不监听任何 HTTP 端口**。转发 channel 在进程内被直接喂给 HTTP handler,不经过本机端口,
   所以网关机上的其它进程也偷用不了真凭证。
 - **身份来自 SSH 公钥**,写进每个请求的 context,客户端伪造不了。设备台账的单一数据源就是
@@ -73,9 +79,9 @@ interceptor,又 `setGlobalDispatcher` 给 undici 装 `EnvHttpProxyAgent`。这�
 只是触发时机从「连上来就握手」变成「CONNECT 之后再握手」。
 
 `HTTPS_PROXY` 实际指向的是设备侧的分流代理(`ccgw-device`),不是网关本身:它对客户端伪装成
-一个普通的 HTTP 代理,同样吃 CONNECT,只是按目标主机再分一次流 —— 只有 `api.anthropic.com`
-才继续往网关走,其余主机它自己拨号应答。为什么这层分流不能靠 `NO_PROXY` 之类的环境变量做,
-见 [docs/transport.md](docs/transport.md#7-设备侧分流代理)。
+一个普通的 HTTP 代理,同样吃 CONNECT,只是按目标主机再分一次流 —— 命中它内置的名单
+(`api.anthropic.com` 加 `tunnelHosts`,和网关同一份)才继续往网关走,其余主机它自己拨号应答。
+为什么这层分流不能靠 `NO_PROXY` 之类的环境变量做,见 [docs/transport.md](docs/transport.md#7-设备侧分流代理)。
 
 ## 技术栈
 
@@ -206,27 +212,52 @@ fork 一次(单飞)。两条路径对「等」的容忍度不同:401 之后**阻
 
 ### 代理放行哪些主机
 
-配置里没有主机名单。网关只服务**一个主机**:`api.anthropic.com`(`isMITMHost`,大小写不敏感)。
-其它主机一律 403,写死在 [`proxy.go`](./proxy.go) 里,不是配置项 —— 「真凭证送给谁」不该是
-部署时能随手改的东西。
+配置里没有主机名单。哪个主机会被解密并注入真凭证、哪些只做盲转发,都写死在
+[`proxy.go`](./proxy.go) 里,**要放行别的主机就改代码重新编译** —— 让它进代码评审,而不是躺在
+某台机器的 YAML 里。「真凭证送给谁」和「哪些 Claude 相关主机经网关」都不该是部署时能随手改的
+东西。
 
-- 客户端无论上游配到哪儿,URL 里的主机名始终是 `api.anthropic.com`,所以一个就够。它也
-  **只能**走这条路:不解密就没法替换 `Authorization`,而设备手上只有占位 token —— 那样每个
-  请求都会 401,网关就白做了。
-- 官方表里挂在这个域下的「WebFetch 域名安全检查、特性开关拉取、遥测事件上报」因此走的都是注入
+两份名单不是「白名单 vs 黑名单」,而是**两种不同的放行方式** —— 判断是「或」:
+
+| 主机 | 判在哪 | 网关怎么处理 |
+|---|---|---|
+| `api.anthropic.com` | `isMITMHost` | 解密 → 把占位 token 换成真凭证 → 转发 |
+| `tunnelHosts` 里的那些 | `hostInList` | 纯字节对拷,**不解密、不碰凭证** |
+| 其它 | 都不命中 | 403 |
+
+- **解密注入只认 `api.anthropic.com`**(大小写不敏感)。客户端无论上游配到哪儿,URL 里的主机名
+  始终是它,所以一个就够。它也**只能**走这条路:盲转发不解密,就没法替换 `Authorization`,而
+  设备手上只有占位 token —— 那样每个请求都会 401,网关就白做了。所以它不在 `tunnelHosts` 里
+  不是被漏掉,是压根不该在那儿。
+
+  官方表里挂在这个域下的「WebFetch 域名安全检查、特性开关拉取、遥测事件上报」因此走的都是注入
   路径 —— 也就是说遥测是通的,并没有被关掉。
+- **`tunnelHosts` 管的是其余 Claude 相关流量能出到哪儿**。设备侧的分流代理(见「隧道口上跑的
+  是什么」)默认把这份名单连同 `api.anthropic.com` 一起送来网关,这份名单就是那部分的闸门。
+  内容对齐官方《Enterprise network configuration》列出的「Claude Code 需要访问的 URL」,共
+  12 个:`claude.ai`、`claude.com`、`code.claude.com`、`platform.claude.com`、
+  `downloads.claude.ai`、`raw.githubusercontent.com`、`registry.npmjs.org`、
+  `formulae.brew.sh`、`mcp-proxy.anthropic.com`、`bridge.claudeusercontent.com`,以及两个
+  遥测主机 `http-intake.logs.us5.datadoghq.com`、`browser-intake-us5-datadoghq.com`。
 
-**其余主机不该到网关这儿。** 它们该由设备侧的分流代理(见「隧道口上跑的是什么」)直接从设备
-本机连出去:WebFetch 抓的网站、npm 包源、第三方 MCP server、`platform.claude.com` 的 OAuth
-token 端点、`downloads.claude.ai`、`mcp-proxy.anthropic.com`、Datadog 遥测……全部从设备本机
-直连,网关完全看不见、也管不着。误把
-`HTTPS_PROXY` 直接指到网关隧道口(而不是经分流代理)的话,被拒的 `CONNECT` 会回一个说得清
-缘由的 403,body 里带主机名和提示 —— 客户端那头只看得到代理的状态码,这个 body 是排查依据。
+盲转发名单里的每一项支持三种写法:`*`(任意主机)、`*.example.com`(子域,不含 `example.com`
+自身)、精确主机名。
 
-网关启动时会把这条打出来:
+**这两份名单只覆盖 Claude Code 自身需要的主机。** WebFetch 抓名单外的站点、连第三方 MCP
+server、`git`/`gh` 打 `github.com` 这类跟 Claude 无关的流量,由设备侧分流代理默认直接从设备
+本机连出去,根本不到网关这儿。误把 `HTTPS_PROXY` 直接指到网关隧道口(而不是经分流代理)的话,
+被拒的 `CONNECT` 会回一个说得清缘由的 403,body 里带主机名和提示 —— 客户端那头只看得到代理的
+状态码,这个 body 是排查依据。
+
+`storage.googleapis.com` 是唯一刻意留在名单外的官方主机:它是多租户通用存储主机,放行等于开一条
+很宽的出口;而官方文档写明这个用途在它被挡时会回落到 `api.anthropic.com`,代价只是 `/plugin` 里
+看不到安装数与插件元数据。
+
+网关启动时会把两份名单打出来,不用翻源码就知道放行了谁:
 
 ```
-代理: 只服务 api.anthropic.com(解密注入),其余主机 403
+代理: 解密注入 api.anthropic.com
+代理: 盲转发 claude.ai, claude.com, code.claude.com, ...
 ```
 
 **注入主机上还有一份路径黑名单** `blockedPaths`。有些功能跟模型调用打同一个
@@ -377,16 +408,17 @@ ccgw-device stop      # 手动停掉(平时不需要,ccgw 会在需要时自动�
 > 详见 [docs/transport.md](docs/transport.md)。`MIN_CLAUDE_VERSION=x.y.z`
 > 可覆盖这个下限,`ALLOW_OLD_CLAUDE=1` 可强行放行(自担后果)。
 >
-> **只有到 `api.anthropic.com` 的流量经过网关。** 分流代理按目标主机分流,遥测、WebFetch 抓的
-> 网页、npm、第三方 MCP server 都由分流代理直接从设备本机连出去,网关看不到、也管不着那部分
-> 流量 —— 网关的职责收窄成「凭证隔离 + 路径黑名单」,不是通用出口代理。
+> **经网关的是 Claude 相关主机,不是设备全部流量。** 分流代理按目标主机分流:内置名单
+> (`api.anthropic.com` 加 `tunnelHosts`,和网关同一份)送去网关,由网关解密注入或盲转发;
+> WebFetch 抓的网页、第三方 MCP server、`github.com` 这类跟 Claude 无关的主机由分流代理直接
+> 从设备本机连出去,网关看不到、也管不着那部分流量。
 
 ## 隧道口上跑的是什么
 
 设备侧只有**一个本地端口**(默认 `127.0.0.1:8788`),但它现在是分流代理(`ccgw-device`)
 自己的监听口,不是 SSH 转发出来的隧道口。`HTTPS_PROXY` 指向它,它按请求分两路:
 
-| 请求形态 | 命中 `--via-gateway`(默认只有 `api.anthropic.com`) | 其余主机 |
+| 请求形态 | Claude 相关主机(内置名单 = `api.anthropic.com` + `tunnelHosts`,和网关同一份) | 其余主机 |
 |---|---|---|
 | `CONNECT host:443` | 分流代理开一个到网关的 direct-tcpip channel,把原始 CONNECT 请求行转发进去,由**网关**回 200 | 分流代理自己直接拨号、自己回 200 |
 | 绝对形式 HTTP(`GET http://host/path`) | 同上,经 SSH channel 转给网关 | 分流代理自己直连目标站 |
@@ -407,8 +439,9 @@ ccgw-device stop      # 手动停掉(平时不需要,ccgw 会在需要时自动�
 
 `CONNECT api.anthropic.com` 到达网关后,网关回 `200 Connection Established` 之后**就地终结
 TLS**:它用自建 CA 现签一张 `api.anthropic.com` 证书,设备用 `NODE_EXTRA_CA_CERTS` 信任这把 CA
-即可;解密出来的请求走正常的注入 + 转发流程。其它主机网关压根看不到,直接由分流代理在设备本机
-处理掉了。
+即可;解密出来的请求走正常的注入 + 转发流程。`tunnelHosts` 里的主机则是回 200 之后纯字节对拷,
+网关不解密、也不碰凭证。真正到不了网关这一层的,是这份内置名单外的主机 —— 它们由分流代理
+直接在设备本机处理掉了。
 
 限额快照两种拿法都行:
 
@@ -574,11 +607,14 @@ time=06:39:33 level=INFO msg="已刷新上游凭证" detail="订阅 OAuth token 
   凭证隔离当场失效。所以登记设备由管理员在网关侧做,设备只会建隧道。
 - **CA 私钥比 host key 更敏感**:拿到 `ccgw_ca_key` 就能对任何信任该 CA 的设备伪造
   `api.anthropic.com`。它只该待在网关机上;分发给设备的 `.crt` 不是密钥。
-- **网关不是设备的出口代理。** 设备侧的分流代理只把 `api.anthropic.com` 送去网关,其余流量
-  从设备本机直连出去,网关看不到、也管不了那部分流量,不承担它的带宽和出口 IP。网关的职责
-  收窄成「凭证隔离 + 路径黑名单」,不是通用出口网关。
+- **网关不是设备的通用出口代理。** 设备侧的分流代理默认把 Claude 相关主机(`api.anthropic.com`
+  加 `tunnelHosts`)送去网关,网关承担这部分的带宽和出口 IP(解密注入或盲转发);跟 Claude
+  无关的流量(WebFetch 抓的网页、第三方 MCP server、`github.com` 之类)由设备本机直连出去,
+  网关看不到、也管不了。网关的职责是「Claude 相关流量的凭证隔离 + 路径黑名单」,不是接管设备
+  的全部出口。
 - **真凭证只会送给 `api.anthropic.com`**,这条写死在代码里(`isMITMHost`),不是配置项 ——
-  换成别的域名就等于把订阅 token 交给那个域名。设备直连的那些流量根本不经过网关,碰不到凭证。
+  换成别的域名就等于把订阅 token 交给那个域名。`tunnelHosts` 里的其余主机虽然也经网关,走的
+  是纯字节盲转发,网关不解密、不碰凭证;完全在这两份名单之外的流量则根本不经过网关。
 - **真凭证只走环境变量。** 别把 token 写进提交的文件;含明文 token 的本地启动脚本(如 `gateway.sh`)
   与本地 `config.yaml` 都已在 `.gitignore` 中。
 - **token 续期**:网关里只贴 access token 会几小时过期;稳妥做法是网关机器正常登录、由网关从

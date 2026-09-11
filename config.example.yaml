@@ -31,9 +31,10 @@ upstream:
   # 刷新用哪个 claude;留空就是裸 "claude" 走 PATH(claude 自更新换了路径也不受影响)。
   claude_bin: ""
 
-# 网关只服务 api.anthropic.com(解密注入真凭证),其它主机一律 403;设备上的分流代理
-# 只把这一个主机送过来,其余流量从设备本机直连。这一条和路径黑名单(Artifact、Remote
-# Control 等)都写死在 proxy.go 里,不是配置项 ——「真凭证送给谁」不该是部署时随手改的东西。
+# 代理的主机名单(api.anthropic.com 解密注入真凭证;其余 Claude 相关主机盲转发;两者之外 403)
+# 和路径黑名单(Artifact、Remote Control)都写死在 proxy.go 里,不是配置项 ——「真凭证送给谁」
+# 和「哪些主机经网关」都不该是部署时随手改的东西。设备侧分流代理默认按同一份名单把 Claude
+# 相关主机送来网关,名单外的主机从设备本机直连。网关启动时会把名单打出来。
 
 # 转发-only SSH 层:唯一对外入口(始终启用)。设备身份 = SSH 公钥,单一数据源就是下面的
 # authorized_keys;客户端发的占位凭证网关不校验,只覆盖。

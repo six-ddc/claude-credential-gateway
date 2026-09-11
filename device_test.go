@@ -22,8 +22,9 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
-// fakeGateway 模拟网关在隧道那头的行为:CONNECT 回 200 后回显,相对路径的明文 HTTP 回一个标记。
-// 记录收到的 CONNECT 目标,用来断言分流是否正确。
+// fakeGateway 模拟网关在隧道那头的行为:CONNECT 回 200 后回显,明文 HTTP 回一个带请求行
+// 目标的标记(相对形式是 /path,绝对形式是 http://host/path)。记录收到的 CONNECT 目标,
+// 用来断言分流是否正确。
 type fakeGateway struct {
 	ln       net.Listener
 	connects chan string
@@ -62,7 +63,7 @@ func (g *fakeGateway) serve(c net.Conn) {
 		io.Copy(c, br) // 回显
 		return
 	}
-	body := "gateway:" + req.URL.RequestURI()
+	body := "gateway:" + req.RequestURI // 原始请求目标:相对形式是 /path,绝对形式带 http://host
 	io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: "+strconv.Itoa(len(body))+"\r\nConnection: close\r\n\r\n"+body)
 }
 
@@ -108,7 +109,7 @@ func connectVia(t *testing.T, proxy, target string) (string, net.Conn) {
 	return res.Status, replayBuffered(c, br)
 }
 
-// 命中 --via-gateway 的 CONNECT 原样转给网关,由网关应答;之后是裸字节流。
+// Claude 相关主机的 CONNECT 原样转给网关,由网关应答;之后是裸字节流。
 func TestSplitProxyRoutesGatewayHostThroughTunnel(t *testing.T) {
 	gw := startFakeGateway(t)
 	proxy := startSplitProxy(t, gw, forgedHost)
@@ -202,7 +203,7 @@ func TestSplitProxyPlainHTTP(t *testing.T) {
 		t.Fatalf("相对路径应转给网关,实际 %q", body)
 	}
 
-	// 绝对 URL、非注入主机:直连
+	// 绝对 URL、名单外主机:直连
 	proxyURL, _ := url.Parse("http://" + proxy)
 	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
 	res, err = client.Get(third.URL + "/x")
@@ -212,7 +213,33 @@ func TestSplitProxyPlainHTTP(t *testing.T) {
 	body, _ = io.ReadAll(res.Body)
 	res.Body.Close()
 	if string(body) != "third:/x" {
-		t.Fatalf("明文 http 到第三方应直连,实际 %q", body)
+		t.Fatalf("明文 http 到名单外主机应直连,实际 %q", body)
+	}
+
+	// 绝对 URL、名单内主机:以绝对形式交给网关,网关才能按主机名分流
+	res, err = client.Get("http://" + forgedHost + "/api/oauth/usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(res.Body)
+	res.Body.Close()
+	if string(body) != "gateway:http://"+forgedHost+"/api/oauth/usage" {
+		t.Fatalf("名单内主机的明文请求应以绝对形式到网关,实际 %q", body)
+	}
+}
+
+// 送去网关的主机 = 注入主机 + 网关盲转发名单,两边同一份数据。
+func TestGatewayHostsCoverTunnelHosts(t *testing.T) {
+	p := newSplitProxy(deadTunnel{}, gatewayHosts())
+	for _, h := range append([]string{forgedHost}, tunnelHosts...) {
+		if !p.viaGateway(h) {
+			t.Fatalf("%s 应经网关", h)
+		}
+	}
+	for _, h := range []string{"github.com", "pypi.org", "mcp.figma.com"} {
+		if p.viaGateway(h) {
+			t.Fatalf("%s 应由设备直连", h)
+		}
 	}
 }
 

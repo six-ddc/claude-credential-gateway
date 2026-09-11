@@ -197,7 +197,8 @@ GATEWAY_HOST_KEY_FP='SHA256:abc123defg456...' \
 
 > 那一个本地端口（默认 `127.0.0.1:8788`）现在是分流代理自己的监听口，不再是 SSH 转发出来的
 > 隧道口：`ccgw` 的 `HTTPS_PROXY` 指向它，取 CA 和查 `/status` 的普通 HTTP 请求也打它。它内部
-> 按目标主机分流,只有 `api.anthropic.com` 才继续经 SSH 送去网关,其余流量分流代理自己直连。
+> 按目标主机分流，分流代理内置的名单（`api.anthropic.com` 加 `tunnelHosts`，和网关同一份，
+> 即全部 Claude 相关主机）才继续经 SSH 送去网关，其余流量分流代理自己直连。
 
 **指纹不符会直接中止**，这是它该做的：
 
@@ -405,9 +406,10 @@ curl -sf -m 2 http://127.0.0.1:8788/status >/dev/null 2>&1 || ~/.ccgw/bin/ccgw-d
 不给 `refreshToken`、`expiresAt` 又设到 2100 年，是为了让客户端别去刷新——拿占位 token 刷新
 必然失败，还会重试、拖慢启动。
 
-> **只有到 `api.anthropic.com` 的流量经过网关**:分流代理按目标主机分流,遥测、WebFetch 抓的
-> 网页、npm、第三方 MCP server 都由分流代理直接从本机连出去,网关看不到、也管不了那部分流量。
-> 认得出「该走网关」的主机由 `--via-gateway` 决定,默认只有 `api.anthropic.com`。
+> **经网关的是分流代理内置名单里的 Claude 相关主机**（`api.anthropic.com` 加 `tunnelHosts`，
+> 和网关同一份）:分流代理按目标主机分流,账号认证、文档查询、包源、MCP connector、遥测这些
+> Claude 相关请求都经它送去网关;WebFetch 抓的网页、第三方 MCP server、`github.com` 这类跟
+> Claude 无关的主机才由分流代理直接从本机连出去,网关看不到、也管不了那部分流量。
 
 ---
 
@@ -512,14 +514,18 @@ curl -sf http://127.0.0.1:8788/ca -o ~/.ccgw/ccgw_ca.crt
 和网关注入的 Bearer 头冲突。`ccgw` 内部会 unset 这几个，但如果你是**手动**设环境变量跑 `claude`，
 就得自己清干净。用 `ccgw` 就不会有这个问题。
 
-### `✗ host not served by gateway` / WebFetch 抓不到某个网站、第三方 MCP server 连不上
+### `✗ host not permitted by gateway`（或 `host not permitted: <host>`）/ WebFetch 抓不到某个网站、第三方 MCP server 连不上
 
-正常使用下**不会看到这个了**：WebFetch、npm、第三方 MCP server 这些请求现在由分流代理直接从
-设备本机连出去，根本不经过网关，也就没有网关这边的 403 需要排查。如果连不上，原因和你平时用
-普通网络时一样（DNS、防火墙、目标站点本身），跟这个网关无关。
+分流代理内置名单（`api.anthropic.com` 加 `tunnelHosts`，和网关同一份）之外的主机才会撞上它：
+WebFetch 抓的网页、第三方（非内置）MCP server、`github.com` 这类跟 Claude 无关的主机，由分流
+代理直接从设备本机连出去，不经过网关，也就不会有这个 403。如果连不上，原因和你平时用普通网络
+时一样（DNS、防火墙、目标站点本身），跟这个网关无关。
 
-如果你确实在响应里看到了 `host not served by gateway` 这句话，说明 `HTTPS_PROXY` 被指到了
-网关的隧道端口而不是分流代理——多半是还在用老版本的接入方式，参见
+如果你确实在响应里看到了这句话，而目标主机其实是 `platform.claude.com`、`registry.npmjs.org`、
+`mcp-proxy.anthropic.com` 这些默认经网关的 Claude 相关主机，说明分流代理的二进制版本落后于
+网关（内置名单和网关的 `tunnelHosts` 不同步了，重跑一遍 `setup-device.sh` 取最新二进制即可），
+或者 `HTTPS_PROXY` 被直接指到了网关的隧道端口而不是分流代理——多半是还在用老版本的接入方式，
+参见
 [docs/migration.md](./migration.md)。
 
 ### `/usage` 显示 "only available for subscription plans"

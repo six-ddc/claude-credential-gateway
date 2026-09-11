@@ -128,7 +128,8 @@ func main() {
 	log.Printf("TLS 终结 CA: %s(设备经隧道 GET /ca 自取)", sshSrv.ca.certPath)
 	caCertPEM = sshSrv.ca.certPEM
 	// 名单写死在代码里,启动时打出来,免得要翻源码才知道放行了谁。
-	log.Printf("代理: 只服务 %s(解密注入),其余主机 403", forgedHost)
+	log.Printf("代理: 解密注入 %s", forgedHost)
+	log.Printf("代理: 盲转发 %s", strings.Join(tunnelHosts, ", "))
 	log.Printf("代理: 路径黑名单 %s", strings.Join(blockedPaths, ", "))
 	log.Printf("设备端二进制目录: %s(ssh <device>@gateway device-binary <os>/<arch>)", cfg.SSH.DeviceBinDir)
 	log.Printf("注入: %s", tokens.describe())
@@ -188,16 +189,23 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 明文 HTTP 经代理时是绝对形式请求(GET http://host/path);https 走 CONNECT,
-	// 在连接层就分流了,到不了这里。网关只服务注入主机,别的主机该由设备侧分流代理直连。
+	// 在连接层就分流了,到不了这里。按主机名决定怎么处理:
+	//   是注入主机(api.anthropic.com)→ 跟解密出来的请求一样,换上游 + 注入真凭证
+	//   在 tunnelHosts 里 → 原样转给它,不注入(WebFetch 抓 http 站点走这条)
+	//   两种都不是 → 403
+	inject := true
 	if r.URL.IsAbs() && !isMITMHost(hostnameOf(r.URL.Host)) {
-		writeError(w, 403, "host not served by gateway: "+r.URL.Host)
-		events.Warn("rejected", "reason", "host_not_allowed", "user", device, "host", r.URL.Host)
-		return
+		if !hostInList(tunnelHosts, hostnameOf(r.URL.Host)) {
+			writeError(w, 403, "host not permitted: "+r.URL.Host)
+			events.Warn("rejected", "reason", "host_not_allowed", "user", device, "host", r.URL.Host)
+			return
+		}
+		inject = false
 	}
 
 	// Artifact、Remote Control 这类功能跟模型调用打同一主机、用同一 OAuth token,
 	// 只能按路径拦,名单见 proxy.go 的 blockedPaths。
-	if isBlockedPath(r.URL.Path) {
+	if inject && isBlockedPath(r.URL.Path) {
 		writeError(w, 403, "endpoint disabled by this gateway: "+r.URL.Path)
 		events.Warn("rejected", "reason", "path_blocked", "user", device, "path", r.URL.Path)
 		return
@@ -213,9 +221,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// 2) 模型(仅审计;真正的 token 用量从响应解析)
 	reqModel := gjson.GetBytes(body, "model").String()
 
-	// 3) 目标 URL。path 原样透传 —— 客户端要打哪个端点就转哪个,
+	// 3) 目标 URL。注入路径下 path 原样透传 —— 客户端要打哪个端点就转哪个,
 	//    不做任何改写(/api/oauth/usage 这类非 /v1/ 端点全靠这一点才能通)。
 	target := upstreamURL.Scheme + "://" + upstreamURL.Host + r.URL.RequestURI()
+	if !inject {
+		target = r.URL.String()
+	}
 
 	// 4) 发一次上游请求。抽成闭包是为了 401 之后能用新 token 原样重放 ——
 	//    两次必须完全一致,只差 Authorization。带上 r.Context():客户端断开时
@@ -227,16 +238,21 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		}
 		// 透明转发:保留客户端(真 Claude Code)拼好的所有头(betas/版本/UA/attestation 在 body)。
 		copyHeaders(upReq.Header, r.Header)
-		// 只换 Host + Authorization(占位 → 真订阅 token)
-		upReq.Host = upstreamURL.Host
-		upReq.Header.Set("authorization", "Bearer "+token)
+		if inject {
+			// 只换 Host + Authorization(占位 → 真订阅 token)
+			upReq.Host = upstreamURL.Host
+			upReq.Header.Set("authorization", "Bearer "+token)
+		}
 		return httpClient.Do(upReq)
 	}
 
-	// 到期前主动刷一次。自刷新没开时是 no-op;开着且已有人在刷时不陪等 ——
-	// 手里这份还够用几十分钟,真废了有下面的 401 兜底。
-	tokens.ensureFresh("")
-	sent := tokens.get()
+	sent := ""
+	if inject {
+		// 到期前主动刷一次。自刷新没开时是 no-op;开着且已有人在刷时不陪等 ——
+		// 手里这份还够用几十分钟,真废了有下面的 401 兜底。
+		tokens.ensureFresh("")
+		sent = tokens.get()
+	}
 
 	upRes, err := send(sent)
 	if err != nil {
@@ -250,7 +266,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	// 太贵。这里立刻换一份新的(自刷新开着就刷,只读模式就从盘上重读),确实变了才重放 ——
 	// 凭证是真死了的话拿到的还是同一个,于是不重放,不会把上游请求量翻倍。
 	// body 早就读进内存了,重放不花额外代价;此时响应头都还没往客户端写,SSE 也不受影响。
-	if upRes.StatusCode == 401 {
+	if inject && upRes.StatusCode == 401 {
 		if fresh := tokens.recoverFrom401(sent); fresh != "" && fresh != sent {
 			upRes.Body.Close()
 			retried = true
@@ -277,7 +293,10 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	events.Info("request", attrs...)
 
 	// 被动采样订阅限额(5h/7d):Anthropic 的每个响应都带这些头,零额外请求。
-	logRateLimit(sampleRateLimit(upRes.Header))
+	// 盲转发出去的第三方响应不看 —— 那些头要么没有,要么含义不同。
+	if inject {
+		logRateLimit(sampleRateLimit(upRes.Header))
+	}
 
 	// 复制响应头并写状态码
 	for k, vs := range upRes.Header {
@@ -302,20 +321,26 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		// 别的日志冲散,而「哪个 401 配哪句解释」是看的人最需要的关联。空 hint 由
 		// dropEmpty 自动丢掉,不占版面。
 		hint := ""
-		if status == 401 {
-			hint = tokens.expiryHint()
-		}
-		if status == 403 && strings.Contains(text, "scope requirement") {
-			hint = "上游凭证的 scope 不够(多半缺 user:profile)。" +
-				"推理不受影响,受影响的是 /usage 与 /api/oauth/* 这类账号端点"
+		if inject {
+			if status == 401 {
+				hint = tokens.expiryHint()
+			}
+			if status == 403 && strings.Contains(text, "scope requirement") {
+				hint = "上游凭证的 scope 不够(多半缺 user:profile)。" +
+					"推理不受影响,受影响的是 /usage 与 /api/oauth/* 这类账号端点"
+			}
 		}
 		// body 放最后:它最长且可能带换行,排在前面会把关键字段挤出视线。
 		events.Warn("upstream error", "user", device, "path", r.URL.Path,
 			"status", status, "hint", hint, "body", text)
 		return
 	}
-	if u := extractUsage(decodeBody(buf.Bytes(), enc), upRes.Header.Get("content-type")); u != nil {
-		logUsage(device, reqModel, u)
+	// token 用量只从 Anthropic 的响应解析:第三方 JSON 里恰好有 model/usage 字段的话,
+	// 不加这层判断就会记成一笔莫须有的用量。
+	if inject {
+		if u := extractUsage(decodeBody(buf.Bytes(), enc), upRes.Header.Get("content-type")); u != nil {
+			logUsage(device, reqModel, u)
+		}
 	}
 }
 
