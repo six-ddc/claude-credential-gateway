@@ -62,10 +62,17 @@ func TestTunnelHostsAllowlist(t *testing.T) {
 		"registry.npmjs.org", "formulae.brew.sh",
 		"mcp-proxy.anthropic.com", "bridge.claudeusercontent.com",
 		"http-intake.logs.us5.datadoghq.com", "browser-intake-us5-datadoghq.com",
+		// Anthropic 自家站点与托管的远程 MCP server(*.mcp.claude.com 通配)
+		"www.anthropic.com", "docs.anthropic.com", "support.claude.com", "status.claude.com",
+		"slack.mcp.claude.com", "microsoft365.mcp.claude.com",
 	} {
 		if !hostInList(tunnelHosts, h) {
 			t.Errorf("%s 应在盲转发名单里", h)
 		}
+	}
+	// 通配只盖子域,不盖 mcp.claude.com 自身
+	if hostInList(tunnelHosts, "mcp.claude.com") {
+		t.Error("*.mcp.claude.com 不该匹配裸域 mcp.claude.com")
 	}
 
 	// storage.googleapis.com 刻意留在外面:多租户通用存储主机,且官方说明它被挡时

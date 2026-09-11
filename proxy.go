@@ -48,8 +48,14 @@ var tunnelHosts = []string{
 	// 包源(按安装方式二选一,留着不碍事)
 	"registry.npmjs.org", // npm / bun 安装方式
 	"formulae.brew.sh",   // Homebrew 安装方式的版本检查
+	// Anthropic 自家站点:WebFetch 抓到它们时也经网关
+	"www.anthropic.com",
+	"docs.anthropic.com",
+	"support.claude.com",
+	"status.claude.com",
 	// MCP 与浏览器扩展
 	"mcp-proxy.anthropic.com",      // claude.ai 侧 MCP connector(claude.ai 账号默认开启)
+	"*.mcp.claude.com",             // Anthropic 托管的远程 MCP server(slack.、microsoft365. 等)
 	"bridge.claudeusercontent.com", // Claude in Chrome 的 WebSocket 桥
 	// 遥测与错误上报(没关 telemetry,这两个要通)
 	"http-intake.logs.us5.datadoghq.com",

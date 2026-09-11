@@ -234,11 +234,14 @@ fork 一次(单飞)。两条路径对「等」的容忍度不同:401 之后**阻
   路径 —— 也就是说遥测是通的,并没有被关掉。
 - **`tunnelHosts` 管的是其余 Claude 相关流量能出到哪儿**。设备侧的分流代理(见「隧道口上跑的
   是什么」)默认把这份名单连同 `api.anthropic.com` 一起送来网关,这份名单就是那部分的闸门。
-  内容对齐官方《Enterprise network configuration》列出的「Claude Code 需要访问的 URL」,共
-  12 个:`claude.ai`、`claude.com`、`code.claude.com`、`platform.claude.com`、
-  `downloads.claude.ai`、`raw.githubusercontent.com`、`registry.npmjs.org`、
-  `formulae.brew.sh`、`mcp-proxy.anthropic.com`、`bridge.claudeusercontent.com`,以及两个
-  遥测主机 `http-intake.logs.us5.datadoghq.com`、`browser-intake-us5-datadoghq.com`。
+  内容以官方《Enterprise network configuration》列出的「Claude Code 需要访问的 URL」为底:
+  `claude.ai`、`claude.com`、`code.claude.com`、`platform.claude.com`、`downloads.claude.ai`、
+  `raw.githubusercontent.com`、`registry.npmjs.org`、`formulae.brew.sh`、`mcp-proxy.anthropic.com`、
+  `bridge.claudeusercontent.com`,以及两个遥测主机 `http-intake.logs.us5.datadoghq.com`、
+  `browser-intake-us5-datadoghq.com`。再加上 Anthropic 自家站点 `www.anthropic.com`、
+  `docs.anthropic.com`、`support.claude.com`、`status.claude.com`(WebFetch 抓到它们时也经网关),
+  和 Anthropic 托管的远程 MCP server `*.mcp.claude.com`(`slack.`、`microsoft365.` 等,用户
+  `claude mcp add` 之后才会连)。
 
 盲转发名单里的每一项支持三种写法:`*`(任意主机)、`*.example.com`(子域,不含 `example.com`
 自身)、精确主机名。
